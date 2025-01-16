@@ -1,0 +1,723 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+
+# load packages
+```{r}
+packages <- c('terra','jsonlite','sp','httr',
+              'rasterVis','tidyverse','magrittr','RColorBrewer','xml2','dygraphs',
+              'xts','DT', 'rprojroot','sf','leaflet','imager')
+invisible(lapply(packages, library, character.only = TRUE))
+library("rje") #expit, logit transformations
+```
+
+# set directories
+```{r}
+outDir<-"D:/Flood_Index/Data/Outputs/"
+inDir<-"D:/Flood_Index/Data/Inputs/"
+```
+
+# Set spatial regions of interest
+```{r}
+marsh<-terra::vect(paste0(inDir,"Nests/SALS_breeding_19Apr23.shp"))
+
+marsh_sf<-st_as_sf(marsh)%>%
+  sf::st_transform('+proj=longlat +datum=WGS84')
+
+
+#slice into states to minimize the boundary extents
+marsh_sf_list<-split(marsh_sf,marsh_sf$STATE)
+
+#st_write(st_as_sf(st_as_sfc(st_bbox(marsh_sf_list[["CT"]]), crs=crs(marsh_sf_list[["CT"]]))),paste0(outDir,"CT_marsh_poly.geojson"))
+
+```
+
+# Load Queried RS image data
+```{r}
+load(file="Outputs/CT_NJ_NH_ME_bands_All_nest_data.Rdata")
+```
+
+#Load nest data
+```{r}
+#read in the time intervals for nest flood events
+#thresh_nest_flood_events<-read.csv(paste0(outDir,"Nest_flood_events/nest_floods_26.7thresh.csv"))%>%
+#  mutate(thresh_time_interval=interval(ymd_hms(str_extract(thresh_time_interval,".*--")),
+#                                       ymd_hms(str_extract(thresh_time_interval,"--.*"))),
+#         start_time=int_start(thresh_time_interval),
+#         end_time=int_end(thresh_time_interval))
+#convert to spatial points
+#nests<-thresh_nest_flood_events%>%
+#  filter(State!="NJ")%>% #we dont have images for NJ
+#  distinct(lat, long, .keep_all=T)%>%
+#  st_as_sf(coords=c("long","lat"),crs="EPSG:26918") #UTM18
+
+nest_locations<-read.csv(paste0(inDir,"Nests/nest_locations_01_3_23.csv"))%>%
+  rename(nest_id=id,site_name=Site,year=Year)%>%
+  # Add nest identifying columns
+  #add site names
+  mutate(site=substr(nest_id,start=1,stop=2),
+         #add nest number
+         nest_num=as.numeric(substr(nest_id,(nchar(nest_id)-2),nchar(nest_id))))
+
+fates<-read.csv(paste0(inDir,"Nests/NestFates_2001-2020.csv"),na.strings=c("","NOT REC","NA"))%>%
+  #select and format variables
+  dplyr::select("nest_id"="SHARPNestID","UltimateNestFate","FirstEggDate"="EstFirstEggDate",
+                "maxeggs"="MaxNumEggs","Nsuccess"="NumFledged",
+                "NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                "NumChicksFlooded","NumChicksFloodedMissing",
+                "NumEggsDepredated", "NumEggsDepredatedMissing","NumChicksDepredated","NumChicksDepredatedMissing")%>%
+  mutate(across(c("NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                  "NumChicksFlooded","NumChicksFloodedMissing","maxeggs","Nsuccess",
+                  "NumEggsDepredated", "NumEggsDepredatedMissing","NumChicksDepredated","NumChicksDepredatedMissing"),
+                as.numeric))%>%
+  # Add nest identifying columns
+  mutate(year=as.numeric(paste0("20",substr(nest_id,start=3,stop=4))),
+         #add site names
+         site=substr(nest_id,start=1,stop=2),
+         #add nest number
+         nest_num=as.numeric(substr(nest_id,(nchar(nest_id)-2),nchar(nest_id))))%>%
+  # Format fate response variables
+  rowwise()%>%
+  # 1. proportion nestlings lost to flooding
+  mutate(flooded_prop=sum(c(NumEggsFloodedInNest,NumEggsFloodedFromNest,NumEggsFloodedMissing,
+                            NumChicksFlooded,NumChicksFloodedMissing),na.rm = T),
+         flooded_prop=round(flooded_prop/maxeggs,2),
+         # 2. Probability nest failed/was successful in general
+         fate=case_when(
+           UltimateNestFate%in%c("FLEDGED")~1,
+           UltimateNestFate%in%c("DEPREDATED","FLOODED","FLOODED/DEPREDATED","NEVER HAD EGGS","NEVER HAD","FAIL UNKNOWN")~0,
+           !(UltimateNestFate%in%c("FLEDGED","DEPREDATED","FLOODED","FLOODED/DEPREDATED",
+                                   "NEVER HAD EGGS","NEVER HAD","FAIL UNKNOWN"))~NA),
+         # 3. Probability nest failed due to flooding
+         flooded_fate=ifelse(UltimateNestFate%in%c("FLOODED","FLOODED/DEPREDATED"),1,0))%>%
+  ungroup()%>%
+  select(nest_id,FirstEggDate, year, site, nest_num, flooded_prop,fate,flooded_fate)
+
+#set all fate variables to NA for nests with NA for ultimate nest fate
+fates[is.na(fates$fate),c(6,8)]<-NA
+fates[is.nan(fates$flooded_prop),6]<-NA
+
+nests<-left_join(nest_locations,fates,by=c("nest_id","year","site","nest_num"))%>%
+  distinct(nest_id,.keep_all = T)%>%
+  mutate(FirstEggDate=mdy(FirstEggDate))%>%
+  #convert to spatial points
+  st_as_sf(coords=c("long","lat"),crs="EPSG:26918")#UTM18
+```
+
+# Access and Interact with the HLS data you queried
+
+```{r, results= "hide"}
+#Set up rgdal configurations to access the cloud assets that we are interested in.
+#You can learn more about these configuration options [here](https://trac.osgeo.org/gdal/wiki/ConfigOptions). 
+setGDALconfig("GDAL_HTTP_UNSAFESSL", value = "YES")
+setGDALconfig("GDAL_HTTP_COOKIEFILE", value = ".rcookies")
+setGDALconfig("GDAL_HTTP_COOKIEJAR", value = ".rcookies")
+setGDALconfig("GDAL_DISABLE_READDIR_ON_OPEN", value = "EMPTY_DIR")
+setGDALconfig("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", value = "TIF")
+```
+
+
+
+## Subset HLS COGs Spatially and Stack HLS Data Layers
+Below, convert the state regions of interest projections into the native projection 
+of HLS, UTM (aligned to the Military Grid Reference System). This must be done 
+in order to use the Regions of Interest (ROIs) to subset the image files.
+If you have trouble running the code chunk below, make sure your credentials are 
+entered correctly in the created netrc file.
+
+```{r, warning=FALSE}
+# Extract the CRS from one of the assets for each state region
+coord_ref_ct <- terra::rast(paste0(state_list[["CT"]]$Asset_Link[1])) 
+coord_ref_nj <- terra::rast(paste0(state_list[["NJ"]]$Asset_Link[1]))
+coord_ref_nh <- terra::rast(paste0(state_list[["NH"]]$Asset_Link[1]))  
+coord_ref_me <- terra::rast(paste0(state_list[["ME"]]$Asset_Link[1]))  
+
+# set each state to its UTM coordinate system (that's what the HLS data is in)
+marsh_sf_list[["CT18"]]<-st_transform(marsh_sf_list[["CT"]],crs(coord_ref_ct))
+marsh_sf_list[["CT19"]]<-st_transform(marsh_sf_list[["CT"]],crs(coord_ref_nh))
+marsh_sf_list[["NJ"]]<-st_transform(marsh_sf_list[["NJ"]],crs(coord_ref_nj))
+marsh_sf_list[["NH"]]<-st_transform(marsh_sf_list[["NH"]],crs(coord_ref_nh))
+marsh_sf_list[["ME"]]<-st_transform(marsh_sf_list[["ME"]],crs(coord_ref_me))
+```
+
+Below, we create a list of raster layers for each of our bands of interest 
+(e.g., Red, NIR, Fmask...). Next each band is read into the memory and then 
+cropped to our area of interest. The Cropped raster will be stacked and  We'll use 
+these stacks to calculate water classifications and mask 
+for cloud contamination. 
+
+Note that the `raster` function is making a separate 
+request for each data layer located in the Cumulus cloud archive. This takes time,
+and the more data layers we have in the time series, the longer this cell takes to
+run.  
+
+```{r, warning=FALSE, results= "hide"}
+
+blue_stack<-green_stack<-red_stack<-nir_stack<-swir1_stack<-swir2_stack<-therm1_stack<-therm2_stack<-fmask_stack<- date_list<-list()
+
+l <- m <- n <-o <- p<- q<- r<- s<- u<- 0
+
+# Do this by state region
+for (state in names(state_list)){
+  search_df_state<- state_list[[state]]
+  if(state!="CT"){
+  roi<-marsh_sf_list[[state]]
+  }
+# for each band image across all scenes of all state events
+for (row in seq(length(search_df_state$band))){
+    #is it a thermal 2 image?
+  if (search_df_state$band[row]=="B11" && substr(search_df_state$Collection[row],4,4)=="L"){
+    l = l+1
+        #read in band image
+    therm2 <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    therm2_crop <- terra::mask(terra::crop(therm2, terra::ext(roi)), roi)
+    therm2_stack[[l]] <- therm2_crop
+    }else if(state=="CT" && crs(therm2)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    therm2_crop <- terra::mask(terra::crop(therm2, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    therm2_stack[[l]] <- therm2_crop
+    }else if(state=="CT" && crs(therm2)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    therm2_crop <- terra::mask(terra::crop(therm2, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    therm2_stack[[l]] <- therm2_crop
+    }
+    rm(therm2, therm2_crop)
+    
+    #is it a thermal 1 image?
+  }else if(search_df_state$band[row]=="B10" && substr(search_df_state$Collection[row],4,4)=="L"){
+    m = m+1
+        #read in band image
+    therm1 <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    therm1_crop <- terra::mask(terra::crop(therm1, terra::ext(roi)), roi)
+    therm1_stack[[m]] <- therm1_crop
+    }else if(state=="CT" && crs(therm1)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    therm1_crop <- terra::mask(terra::crop(therm1, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    therm1_stack[[m]] <- therm1_crop
+    }else if(state=="CT" && crs(therm1)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    therm1_crop <- terra::mask(terra::crop(therm1, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    therm1_stack[[m]] <- therm1_crop
+    }
+    rm (therm1, therm1_crop)
+    
+    #is it a swir 2 image?
+  }else if (search_df_state$band[row] %in% c('B07','B12')){
+    n = n+1
+        #read in band image
+    swir2 <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    swir2_crop <- terra::mask(terra::crop(swir2, terra::ext(roi)), roi)
+    swir2_stack[[n]] <- swir2_crop
+    }else if(state=="CT"&crs(swir2)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    swir2_crop <- terra::mask(terra::crop(swir2, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    swir2_stack[[n]] <- swir2_crop
+    }else if(state=="CT"&crs(swir2)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    swir2_crop <- terra::mask(terra::crop(swir2, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    swir2_stack[[n]] <- swir2_crop
+    }
+    rm (swir2, swir2_crop)
+    
+    #is it a swir 1 image?
+  }else if (search_df_state$band[row]=='B06' || (search_df_state$band[row]=='B11'&& substr(search_df_state$Collection[row],4,4)=="S")){
+    o = o+1
+        #read in band image
+    swir1 <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    swir1_crop <- terra::mask(terra::crop(swir1, terra::ext(roi)), roi)
+    swir1_stack[[o]] <- swir1_crop
+    }else if(state=="CT"&crs(swir1)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    swir1_crop <- terra::mask(terra::crop(swir1, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    swir1_stack[[o]] <- swir1_crop
+    }else if(state=="CT"&crs(swir1)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    swir1_crop <- terra::mask(terra::crop(swir1, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    swir1_stack[[o]] <- swir1_crop
+    }
+    rm (swir1, swir1_crop)
+    
+    #is it a NIR image?
+  }else if (search_df_state$band[row] %in% c('B05','B8A')){
+    p = p+1
+    nir <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+    nir_crop <- terra::mask (terra::crop(nir, terra::ext(roi)), roi)
+    nir_stack[[p]] <- nir_crop
+    }else if(state=="CT"&crs(nir)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    nir_crop <- terra::mask(terra::crop(nir, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    nir_stack[[p]] <- nir_crop
+    }else if(state=="CT"&crs(nir)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    nir_crop <- terra::mask(terra::crop(nir, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    nir_stack[[p]] <- nir_crop
+    }  
+    rm(nir, nir_crop)
+    
+    # is it a red image?
+  }else if (search_df_state$band[row]=='B04'){
+    q = q+1
+        #read in band image
+    red <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    red_crop <- terra::mask(terra::crop(red, terra::ext(roi)), roi)
+    red_stack[[q]] <- red_crop
+    }else if(state=="CT"&crs(red)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    red_crop <- terra::mask(terra::crop(red, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    red_stack[[q]] <- red_crop
+    }else if(state=="CT"&crs(red)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    red_crop <- terra::mask(terra::crop(red, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    red_stack[[q]] <- red_crop
+    }
+    rm (red, red_crop)
+    
+    #is it a blue image?
+  }else if (search_df_state$band[row]=='B02'){
+    r = r+1
+        #read in band image
+    blue <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    blue_crop <- terra::mask(terra::crop(blue, terra::ext(roi)), roi)
+    blue_stack[[r]] <- blue_crop
+    }else if(state=="CT"&crs(blue)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    blue_crop <- terra::mask(terra::crop(blue, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    blue_stack[[r]] <- blue_crop
+    }else if(state=="CT"&crs(blue)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    blue_crop <- terra::mask(terra::crop(blue, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    blue_stack[[r]] <- blue_crop
+    }
+    rm (blue, blue_crop)
+    
+    #is it a green image?
+  }else if (search_df_state$band[row]=='B03'){
+    s = s+1
+        #read in band image
+    green <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    green_crop <- terra::mask(terra::crop(green, terra::ext(roi)), roi)
+    green_stack[[s]] <- green_crop
+    }else if(state=="CT"&crs(green)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    green_crop <- terra::mask(terra::crop(green, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    green_stack[[s]] <- green_crop
+    }else if(state=="CT"&crs(green)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    green_crop <- terra::mask(terra::crop(green, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    green_stack[[s]] <- green_crop
+    }
+    rm (green, green_crop)
+    
+    #is it a Quality image?
+  }else if (search_df_state$band[row]=='Fmask'){
+    u = u+1
+        #read in band image
+    fmask <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+    if(state!="CT"){
+        #crop to ROI
+    fmask_crop <- terra::mask(terra::crop(fmask, terra::ext(roi)), roi)
+    fmask_stack[[u]] <- fmask_crop
+    }else if(state=="CT"&crs(fmask)==crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    fmask_crop <- terra::mask(terra::crop(fmask, terra::ext(marsh_sf_list[["CT18"]])), marsh_sf_list[["CT18"]])
+    fmask_stack[[u]] <- fmask_crop
+    
+    }else if(state=="CT"&crs(fmask)!=crs(marsh_sf_list[["CT18"]])){
+          #crop to ROI
+    fmask_crop <- terra::mask(terra::crop(fmask, terra::ext(marsh_sf_list[["CT19"]])), marsh_sf_list[["CT19"]])
+    fmask_stack[[u]] <- fmask_crop
+    }
+    
+    # also record the image information and add to a matching index list
+    doy_time = strsplit(sources(fmask), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+    time <- paste(substr(doy_time, 9, 10),substr(doy_time, 11, 12),sep=":")
+    
+    if (strsplit(sources(fmask), "[.]")[[1]][12] == 'S30'){
+      date_list[[u]] <- paste0('S',as.character(date),'T',time)
+    }else{
+      date_list[[u]] <- paste0('L',as.character(date),'T',time)
+    }
+    rm (fmask, fmask_crop)
+    
+  }
+}
+}
+
+
+save(list=c("blue_stack","green_stack","red_stack","nir_stack","swir1_stack","swir2_stack","therm1_stack","therm2_stack"), file="Outputs/band_stacks_all_nests_NJ_CT_NH_ME.Rdata")
+```
+
+# Calculate water indices
+
+Now we can start asking our science questions. First we define the water classification functions 
+and then execute them on the band data loaded into memory. After that, we can perform 
+quality filtering to screen out any poor-quality observations.
+
+Create a function to calculate FLATS, TC Wetness, and NDWI/Pheno indices to create FLATS coefficients calibrated to our data.
+
+```{r}
+calculate_flats <- function(red, swir1, green){
+ndwi <- (red-swir1)/(red+swir1)
+pheno <- (green-red)/(green+red)
+flats<- expit(-1.6+20*ndwi+68.6*pheno) #expit back transforms into response values from GLM logit transformation
+return(flats)
+}
+
+calculate_ndwi <- function(red, swir1){
+ndwi <- (red-swir1)/(red+swir1)
+return(ndwi)
+}
+
+calculate_pheno <- function(green,red){
+pheno <- (green-red)/(green+red)
+return(pheno)
+}
+
+calculate_tcwet <- function(blue,green,red,nir,swir1,swir2){
+tcwet<-(0.1509*blue)+(0.1973*green)+(0.3279*red)+(0.3406*nir)-(0.7112*swir1)-(0.4572*swir2)
+return(tcwet)
+}
+
+# test set of thresholds to see which cut off leads to the most accurate predictions
+```
+
+Now we can calculate variables needed to create water indices from the stacked band rasters. We will
+create layer names from the dates the data is captured, along with the
+first letter of **L** and **S** shows which sensor is data from.
+
+```{r, warning=FALSE}
+flats_stack<-list()
+for (i in 1:length(red_stack)){ 
+  # Calculate FLATS 
+  flats_stack[[i]] <- calculate_flats(red_stack[[i]],swir1_stack[[i]], green_stack[[i]])  
+  # Exclude the Inf and -Inf values
+  flats_stack[[i]][flats_stack[[i]] == Inf] <- NA
+  flats_stack[[i]][flats_stack[[i]] == -Inf] <- NA
+}
+names(flats_stack) <- unlist(date_list)
+
+
+ndwi_stack <- list()
+for (i in 1:length(red_stack)){ 
+  # Calculate NDWI 
+  ndwi_stack[[i]] <- calculate_ndwi(red_stack[[i]],swir1_stack[[i]])  
+  # Exclude the Inf and -Inf values
+  ndwi_stack[[i]][ndwi_stack[[i]] == Inf] <- NA
+  ndwi_stack[[i]][ndwi_stack[[i]] == -Inf] <- NA
+  
+}
+names(ndwi_stack) <- unlist(date_list)
+
+
+
+pheno_stack <- list()
+for (i in 1:length(red_stack)){ 
+  # Calculate PHENO 
+  pheno_stack[[i]] <- calculate_pheno(green_stack[[i]],red_stack[[i]])  
+  # Exclude the Inf and -Inf values
+  pheno_stack[[i]][pheno_stack[[i]] == Inf] <- NA
+  pheno_stack[[i]][pheno_stack[[i]] == -Inf] <- NA
+}
+names(pheno_stack) <- unlist(date_list)
+
+
+
+
+tcwet_stack <- list()
+for (i in 1:length(red_stack)){ 
+  # Calculate TCWET 
+  tcwet_stack[[i]] <- calculate_tcwet(blue_stack[[i]],green_stack[[i]],red_stack[[i]],nir_stack[[i]],swir1_stack[[i]],swir2_stack[[i]])  
+  # Exclude the Inf and -Inf values
+  tcwet_stack[[i]][tcwet_stack[[i]] == Inf] <- NA
+  tcwet_stack[[i]][tcwet_stack[[i]] == -Inf] <- NA
+}
+names(tcwet_stack) <- unlist(date_list)
+
+
+
+#also name the QA bands with date-state 
+names(fmask_stack) <- unlist(date_list)
+```
+
+
+Now extract pixel values that contain nest locations
+```{r}
+flats_pix<-ndwi_pix<-pheno_pix<-tcwet_pix<- fmask_pix<-list()
+
+for (i in 1:nrow(nests)){
+  # extract pixel FLATS values at each location
+flats_pix[[i]]<-lapply(flats_stack,function(x) terra::extract(x,terra::project(vect(nests[i,]), crs(x))))
+flats_pix[[i]]<-do.call('rbind',lapply(flats_pix[[i]],function(x){
+  names(x)<-c("ID","flats")
+  return(x)
+}))
+flats_pix[[i]]<-flats_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = flats)
+
+# extract pixel NDWI values at each location
+ndwi_pix[[i]]<-lapply(ndwi_stack,function(x) terra::extract(x,terra::project(vect(nests[i,]), crs(x))))
+ndwi_pix[[i]]<-do.call('rbind',lapply(ndwi_pix[[i]],function(x){
+  names(x)<-c("ID","ndwi")
+  return(x)
+}))
+ndwi_pix[[i]]<-ndwi_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = ndwi)
+
+# extract pixel PHENO values at each location
+pheno_pix[[i]]<-lapply(pheno_stack,function(x) terra::extract(x,terra::project(vect(nests[i,]), crs(x))))
+pheno_pix[[i]]<-do.call('rbind',lapply(pheno_pix[[i]],function(x){
+  names(x)<-c("ID","pheno")
+  return(x)
+}))
+pheno_pix[[i]]<-pheno_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = pheno)
+
+# extract pixel TCWET values at each location
+tcwet_pix[[i]]<-lapply(tcwet_stack,function(x) terra::extract(x,terra::project(vect(nests[i,]), crs(x))))
+tcwet_pix[[i]]<-do.call('rbind',lapply(tcwet_pix[[i]],function(x){
+  names(x)<-c("ID","tcwet")
+  return(x)
+}))
+tcwet_pix[[i]]<-tcwet_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = tcwet)
+
+#extract pixel QA values at each location
+fmask_pix[[i]]<-lapply(fmask_stack,function(x) terra::extract(x,terra::project(vect(nests[i,]), crs(x))))
+fmask_pix[[i]]<-do.call('rbind',lapply(fmask_pix[[i]],function(x){
+  names(x)<-c("ID","fmask")
+  return(x)
+}))
+fmask_pix[[i]]<-fmask_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = fmask)
+
+}
+  #combines all the band extraction columns into one table like cbind
+flats_pix2<-do.call('rbind',flats_pix)%>%
+  arrange(ID)%>%
+  cbind(nests[,1:3])%>%
+  dplyr::select(-ID)
+
+ndwi_pix2<-do.call('rbind',ndwi_pix)%>%
+  arrange(ID)%>%
+  cbind(nests[,1:3])%>%
+  dplyr::select(-ID)
+
+pheno_pix2<-do.call('rbind',pheno_pix)%>%
+  arrange(ID)%>%
+  cbind(nests[,1:3])%>%
+  dplyr::select(-ID)
+
+tcwet_pix2<-do.call('rbind',tcwet_pix)%>%
+  arrange(ID)%>%
+  cbind(nests[,1:3])%>%
+  dplyr::select(-ID)
+
+fmask_pix2<-do.call('rbind',fmask_pix)%>%
+  arrange(ID)%>%
+  cbind(nests[,1:3])%>%
+  dplyr::select(-ID)
+
+```
+
+# Transform each metric into a binary flood indicator
+```{r}
+# Function to extract whether a pixel is water from bit coded QA values 
+water_flag = function(fmask) {
+  # reverse order of bits, left to right
+  bit_str = paste(as.integer(intToBits(fmask)), collapse="")
+  water = substr(bit_str, 6, 6) == '1' #bit 6 if you start counting from bit 0 as place 1.
+  if(water){return(1)}  else{return(0)}
+}
+
+
+```
+
+Now we plot! Let's star with the first item in NDVI time series.
+
+```{r, warning=FALSE, message=FALSE}
+# Create a color palette 
+pal <- colorNumeric(terrain.colors(n = 100), c(0,1) ,na.color = "transparent", reverse = TRUE)
+
+leaflet() %>% 
+    addProviderTiles(providers$Esri.WorldImagery) %>%
+    addRasterImage(ndvi_stacks[[1]], color = pal, opacity = 1) %>%
+    addPolygons(data = cropland_geojson, fill = FALSE) %>%
+    addMiniMap(zoomLevelFixed = 5) %>%
+    leaflet::addLegend(pal = pal, values = c(0,1), title = "NDVI")
+
+```
+
+------------------------------------------------------------------------
+
+## 4b. Quality Filtering
+
+Now we should do additional quality filtering.
+
+In HLS, both value of 0 and 64 in the Fmask layer indicate the pixel without cloud, 
+cloud shadow, water, or snow/ice. A value of 0 also shows climatology aerosol level 
+and 64 shows low aerosol level. We will use these values to mask out poor quality 
+pixels from the ndvi_stacks. HLS quality information can be found in section 6.5 
+of the [HLS V2.0 User Guide](https://lpdaac.usgs.gov/documents/1118/HLS_User_Guide_V2.pdf).
+
+Create a stack of masked rasters and mask poor quality pixels.
+
+
+
+```{r, warning=FALSE}
+mask_raster <- list()
+ndvi_filtered <- list()
+
+for (i in 1:length(fmask_stack)){
+  mask_raster[[i]] <- fmask_stack[[i]]
+  mask_raster[[i]][values(mask_raster[[i]])!= 0 || values(mask_raster[[i]])!= 64] <- NA
+  ndvi_filtered[[i]] <- mask(ndvi_stacks[[i]], mask_raster[[i]], maskvalue=NA )
+  names(ndvi_filtered[[i]]) <- names(ndvi_stacks[[i]])
+}
+ndvi_filtered_stacks <- terra::rast(ndvi_filtered)
+```
+
+------------------------------------------------------------------------
+
+## 4c.Visualize Quality Filtered Stacked Time Series
+
+Now we can plot multiple layers to create an interactive NDVI time
+series map with `leaflet`. Click on the dates on the left side to view
+the layer.
+
+```{r, warning=FALSE, message=FALSE}
+
+base<-c('map<-leaflet()%>%
+            addProviderTiles(providers$Esri.WorldImagery) %>%
+            addMiniMap(zoomLevelFixed = 5) %>%')
+
+# make a string including the addRasterImage function for every layer in the raster stack
+X <- lapply(1:nlyr(ndvi_filtered_stacks), function(j){
+    paste(paste("addRasterImage(ndvi_filtered_stacks[[",j,"]],
+             colors = pal,
+             opacity=1,
+             group=names(ndvi_filtered_stacks[[",j,"]]))", sep=""),"%>% \n")})
+
+X <- do.call(paste, X)
+
+controls<-"addLayersControl(baseGroups=names(ndvi_stacks),
+               options = layersControlOptions(collapsed=F), position = 'topleft')%>%"
+
+legend <- "leaflet::addLegend(pal = pal, values = c(0,1), title = 'NDVI')"
+
+final <- paste(base, X, controls, legend ,sep="\n")
+eval(parse(text=final))
+map
+```
+
+Above, the time series show the changes in NDVI over the two months of September 
+and August 2021. The NDVI values over these agricultural fields are high and stable 
+and then they drastically decrease showing that they are cultivated before the send of September. 
+
+
+
+------------------------------------------------------------------------
+
+## 4d. Export Statistics
+
+Below, plot the time series as boxplots showing the distribution of NDVI values 
+for our farm fields.
+
+```{r, fig.width=15}
+raster::boxplot(ndvi_filtered_stacks, col=c('olivedrab3'),  main='NDVI Time Series', ylab='NDVI', names = names(ndvi_stacks), las=2)
+```
+
+Next, calculate the statistics for each observation and export to CSV. Quality 
+filtered raster stack is used to calculate the statistics.
+
+```{r}
+ndvi_mean <- terra::global(ndvi_filtered_stacks, 'mean', na.rm=TRUE)
+ndvi_max <- terra::global(ndvi_filtered_stacks, 'max', na.rm=TRUE)
+ndvi_min <- terra::global(ndvi_filtered_stacks, 'min', na.rm=TRUE)
+ndvi_sd <- terra::global(ndvi_filtered_stacks, 'sd', na.rm=TRUE)
+#ndvi_median <- terra::global(ndvi_filtered_stacks, 'median', na.rm=TRUE)    # the global function does not have median
+```
+
+Make interactive plots of raster statistics using `dygraphs` library. The date is 
+formatted using `lubridate` package and `xts` package is used to transform the 
+dataframe to the xts format.
+
+```{r}
+stats <- data.frame(
+  Date=substr(names(ndvi_filtered_stacks), 2,11),
+  NDVI_Max = ndvi_max,
+  NDVI_Min = ndvi_min,
+  #NDVI_Median = ndvi_median,
+  NDVI_mean = ndvi_mean,
+  NDVI_SD = ndvi_sd
+)
+stats$Date <- ymd(stats$Date)                      # reformat the date
+variables = xts(x=stats[,-1], order.by=stats$Date) # Choose the cols with the variables
+dygraph(variables)
+```
+
+If you want to export these statistics, we can do so to a CSV file.
+
+```{r}
+stats_name <- file.path(outDir, "NDVI_Statistics.csv")
+write.csv(stats,stats_name)
+```
+
+------------------------------------------------------------------------
+
+# 5. Export Output to GeoTIFF
+
+Finally, if you want to capture the final output files locally on your
+machine, you can export the output files as GeoTIFFs.
+
+```{r, warning = FALSE}
+for (i in 1:length(ndvi_filtered)){
+  output_name <- file.path(outDir, paste0(names(ndvi_filtered[[i]]), "_NDVI.tif"))
+  terra::writeRaster(ndvi_filtered[[i]], output_name, overwrite = TRUE)
+}
+```
+
+The raster stack object can also be written to the disk.
+
+```{r, warning=FALSE}
+output_name <- file.path(outDir, "NDVI_stack.tif")
+terra::writeRaster(ndvi_filtered_stacks ,filename=output_name, overwrite=TRUE)
+```
+
+
+And we're done! You have successfully analyzed
+data in the cloud, exporting just the information you needed for your area 
+of interest rather than having to download everything.
+
+
+Now, the cropped and stacked rasters are loaded into memory without being 
+downloaded. Running the code below should confirm this is true.
+
+```{r}
+inMemory(nir_stack[[1]])
+
+t<-do.call("rbind",state_list)
+count(t,band)
+```

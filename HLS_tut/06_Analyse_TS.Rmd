@@ -1,0 +1,57 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+
+# load packages
+```{r}
+packages <- c('terra','tidyverse','sf')
+invisible(lapply(packages, library, character.only = TRUE))
+library("rje") #expit, logit transformations
+```
+
+# set directories
+```{r}
+outDir<-"D:/Flood_Index/Data/Outputs/"
+inDir<-"D:/Flood_Index/Data/Inputs/"
+```
+
+# Quality Filtering
+
+Now we should do additional quality filtering.
+
+In HLS, both value of 0 and 64 in the Fmask layer indicate the pixel without cloud, 
+cloud shadow, water, or snow/ice. A value of 0 also shows climatology aerosol level 
+and 64 shows low aerosol level. We will use these values to mask out poor quality 
+pixels from the ndvi_stacks. HLS quality information can be found in section 6.5 
+of the [HLS V2.0 User Guide](https://lpdaac.usgs.gov/documents/1118/HLS_User_Guide_V2.pdf).
+
+```{r, warning=FALSE}
+#nests_all_bands_clear<-nests_all_bands%>%
+#  filter(!(FMask%in%c(0,64)))
+nests_all_bands<-read.csv(paste0(outDir,"CT_nests_all_HLS_bands.csv"))
+
+cloud_shadow_flag = function(pixel) {
+  # reverse order of bits, left to right
+  bit_str = paste(as.integer(intToBits(pixel)), collapse="")
+  cloud = substr(bit_str, 1, 1) == '1' #based on pg 17 of HLS User Guide V2
+  dilation = substr(bit_str, 2, 2) == '1'
+  shadow = substr(bit_str, 3, 3) == '1'
+  if(any(water,dilation,shadow)){return(1)}  else{return(0)}
+}
+
+clear_flag = function(pixel) {
+  # reverse order of bits, left to right
+  bit_str = paste(as.integer(intToBits(pixel)), collapse="")
+  clear = substr(bit_str, 6, 6) == '1'|| substr(bit_str, 7, 7) == '1'#based on pg 17 of HLS User Guide V2
+  if(clear){return(1)}  else{return(0)}
+}
+nests_all_bands_clear<-nests_all_bands%>%
+  mutate(bit_str = paste(as.integer(intToBits(FMask)), collapse=""),
+         cloud_shadow=ifelse(substr(bit_str, 1, 1) == '1'|substr(bit_str, 2, 2) == '1'|substr(bit_str, 3, 3) == '1',1,0),
+         clear=ifelse(substr(bit_str, 6, 6) == '1'|substr(bit_str, 7, 7) == '1',1,0))
+  
+
+write.csv(nests_all_bands_clear,paste0(outDir,"CT_nests_all_HLS_bands_clear.csv"),row.names=F)
+```

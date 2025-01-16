@@ -1,0 +1,244 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+#load packages
+```{r}
+packages <- c('terra','jsonlite','sp','httr',
+              'rasterVis','tidyverse','magrittr','RColorBrewer','xml2','dygraphs',
+              'xts','DT', 'rprojroot','sf','leaflet','imager')
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+#set directories
+```{r}
+outDir<-"D:/Flood_Index/Data/Outputs/"
+inDir<-"D:/Flood_Index/Data/Inputs/"
+```
+
+#assign the LPCLOUD STAC Search URL to an object
+```{r}
+search_URL <- 'https://cmr.earthdata.nasa.gov/stac/LPCLOUD/search'
+```
+
+#set the path to your netrc file. This has your login credentials for NASA earthdata.
+```{r}
+source("Functions/earthdata_netrc_setup.R")
+```
+
+
+# Query data that meet your location and time of interest
+#1. list which data products you want to query from. We want both the sentinel and landsat data.
+```{r}
+HLS_col <- list("HLSS30.v2.0", "HLSL30.v2.0") #"VNP46A2", "VJ146A2","VNP21A1D.002","VJ121A1D.002","VNP21A1N.002","VJ121A1N.002"
+```
+
+#2. Set spatial regions of interest
+```{r}
+marsh<-terra::vect(paste0(inDir,"Nests/SALS_breeding_19Apr23.shp"))
+
+marsh_sf<-st_as_sf(marsh)%>%
+  sf::st_transform('+proj=longlat +datum=WGS84')
+```
+
+
+```{r}
+#slice into states to minimize the boundary extents
+marsh_sf_list<-split(marsh_sf,marsh_sf$STATE)
+
+#write each state marsh boundary extent to json file for use in online query platforms
+#st_write(st_as_sf(st_as_sfc(st_bbox(marsh_sf_list[["CT"]]), crs=crs(marsh_sf_list[["CT"]]))),paste0(outDir,"CT_marsh_poly.geojson"))
+
+#visually confirm the state marsh boundaries are correct
+#leaflet() %>% 
+#  addPolygons(data = marsh_sf_list[["NJ"]], fill = FALSE) %>%
+#  addProviderTiles(providers$Esri.WorldImagery) %>% 
+#  addMiniMap(zoomLevelFixed = 5)
+
+# get just the extents for each state
+bb_list<-lapply(marsh_sf_list,st_bbox)
+bb_list<-lapply(bb_list,function(x) paste(x[1], x[2], x[3], x[4], sep = ','))
+```
+
+#3. Set time intervals of interest
+```{r}
+#read in the time intervals for nest flood events
+thresh_nest_flood_events<-read.csv(paste0(outDir,"Nest_flood_events/nest_floods_26.7thresh.csv"))%>%
+  mutate(thresh_time_interval=interval(ymd_hms(str_extract(thresh_time_interval,".*--")),
+                                       ymd_hms(str_extract(thresh_time_interval,"--.*"))),
+         start_time=int_start(thresh_time_interval),
+         end_time=int_end(thresh_time_interval))
+
+
+# combine all overlapping time intervals into main time chunks for each state
+events<-thresh_nest_flood_events%>%
+  group_by(State)%>%
+  arrange(start_time,by_group=T)%>%
+  mutate(indx = c(0, cumsum(as.numeric(lead(start_time)) >
+                              cummax(as.numeric(end_time)))[-n()])) %>%
+  group_by(State, indx) %>%
+  summarise(start_time = as.character(min(start_time)), 
+            end_time = as.character(max(end_time))) %>%
+  select(-indx)
+
+#time query format YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ
+events_list<-events%>%
+  mutate(time=paste0(str_extract(start_time,".* "),"T",str_extract(start_time," .*"),"Z/",
+         str_extract(end_time,".* "),"T",str_extract(end_time," .*"),"Z"),
+         time=gsub(" ","",time))%>%
+  dplyr::select(State,time)%>%
+  ungroup()%>%
+  split(events$State)
+
+
+#list of events pooled by state region
+flood_events_list<-lapply(events_list,function(x) dplyr::select(x,time))
+
+```
+
+#4. Submit a seach query based on place and time critera
+```{r}
+#submit a request to the CMR-STAC endpoint using httr package
+#output will show all the available data matching our search criteria
+#select which regions are represented in the time intervals of interest
+bb_list2<-bb_list[names(flood_events_list)]
+
+#list to hold the search request outputs for state
+flood_search_req<-vector(mode='list', length=length(flood_events_list))
+names(flood_search_req)<-names(flood_events_list)
+
+for(state in names(flood_events_list)){
+  temp<-flood_events_list[[state]]
+  #list to hold the search request outputs for each flood event date range within the state
+  flood_search_req_list<-list()
+  for(j in 1:nrow(temp)){
+flood_search_body <- list(limit=200,
+             datetime=as.character(temp[j,]),
+             bbox= bb_list2[[state]],
+             collections= HLS_col)
+
+flood_search_req_list[[j]] <- httr::POST(search_URL, body = flood_search_body, encode = "json") %>% 
+  httr::content(as = "text") %>% 
+  fromJSON()
+#paste0('Date ',j,": ",flood_search_req_list[[j]][["context"]][["matched"]], ' features.\n')
+  }
+flood_search_req[[state]]<-flood_search_req_list
+}
+```
+
+
+
+```{r}
+#check # time intervals that had image results
+sum(unlist(lapply(flood_search_req[["NJ"]],function(x) length(x[["features"]])>0)))
+
+#check # time intervals that had image results
+sum(unlist(lapply(flood_search_req[["CT"]],function(x) length(x[["features"]])>0)))
+#check # total image results
+sum(unlist(lapply(flood_search_req[["CT"]],function(x) nrow(x[["features"]]))))
+
+sum(unlist(lapply(flood_search_req[["NH"]],function(x) length(x[["features"]])>0)))
+sum(unlist(lapply(flood_search_req[["NH"]],function(x) nrow(x[["features"]]))))
+
+sum(unlist(lapply(flood_search_req[["ME"]],function(x) length(x[["features"]])>0)))
+sum(unlist(lapply(flood_search_req[["ME"]],function(x) nrow(x[["features"]]))))
+
+#Detailed information about the feature in our response can be found in `features` field.
+search_features <- flood_search_req[["CT"]][[19]]$features
+Feature1 <- search_features[6,]
+browse_image_url <- Feature1$assets$browse$href
+
+browse <-imager::load.image(browse_image_url)
+plot(browse)
+```
+## 5. Subset data by Band
+
+Include visible, NIR, and SWIR bands to look at reflectance distribution for flooded/not flooded nest sites.
+Include Quality (Fmask) layers in the list of links to access.
+
+-   Sentinel 2:
+
+    -   SWIR2 = B12 
+    -   SWIR1 = B11 
+    -   "narrow" NIR = B8A
+    -   Red = B04
+    -   Green = B03
+    -   Blue = B02
+    -   Quality = Fmask
+
+-   Landsat 8:
+
+    -   SWIR2 = B07 or band07
+    -   SWIR1 = B06 or band06
+    -   NIR = B05
+    -   Red = B04 or band04
+    -   Green = B03 or band03
+    -   Blue = B02 or band02
+    -   Thermal 1 = B10
+    -   Thermal 2 = B11
+    -   Quality = Fmask
+
+Below, we'll make a searchable data table of all data product bands that match date ranges within the state regions of interest. The `state_list` object is defined to store these links. Our final step will be a searchable data table!
+
+```{r}
+#flood_search_req is structured as:
+# first divided by state
+# then flood dates within each state
+# then all the data products that matched that date
+
+#loop through all the data products by going state by state, 
+# then date by date to get the features we want to filter for each data product
+state_list <-vector(mode='list', length=length(flood_search_req))
+names(state_list)<-names(flood_search_req)
+
+for(state in names(flood_search_req)){
+  #first state
+search_dates <- flood_search_req[[state]]
+
+  #then date within state
+date_list <- list()
+for(j in 1:length(search_dates)){
+  #get metadata about the images collected within each flood date range in the state region
+search_features<-search_dates[[j]]$features
+
+  # apply image attribute filter to one date range image at a time
+feat_list <- list()
+    #only if images were found
+if(!is.null(nrow(search_features))){
+for(k in 1:nrow(search_features)){
+Feature <- search_features[k,]
+band_list<-list()
+  # FILTER:
+  # 1. Get the visible, NIR, SWIR, and Quality band layer names
+  if (Feature$collection == 'HLSS30_2.0'){
+    bands <- c('B12','B11','B8A','B04','B03','B02','Fmask')
+  }else{
+    bands <- c('B11','B10','B07','B06','B05','B04','B03','B02','Fmask')
+  }
+  for(b in bands){
+    b_assets <- Feature$assets[[b]]$href
+    
+    df <- data.frame(Collection = Feature$collection,                    # Make a data frame including links and other info
+                     Granule_ID = Feature$id,
+                     Cloud_Cover = Feature$properties$`eo:cloud_cover`,
+                     band = b,
+                     Asset_Link = b_assets, stringsAsFactors=FALSE)
+    band_list[[b]] <- df
+  }
+feat_list[[k]] <- do.call(rbind, band_list)
+}
+date_list[[j]]<-do.call(rbind, feat_list)%>%
+  #remove any images with greater than 95% cloud cover
+  filter(Cloud_Cover<95)
+}
+}
+state_list[[state]]<-do.call(rbind,date_list)
+}
+
+# Create a searchable datatable of all bands, from all data products, from all date ranges, from all state regions
+search_df <- do.call(rbind, state_list)
+
+#DT::datatable(search_df)#view the table of bands
+
+#save(list=c("flood_search_req","state_list","search_df"),file="Outputs/CT_NJ_NH_ME_bands.Rdata")
+```

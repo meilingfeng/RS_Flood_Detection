@@ -1,0 +1,260 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+#load packages
+```{r}
+packages <- c('terra','jsonlite','sp','httr',
+              'rasterVis','tidyverse','magrittr','RColorBrewer','xml2','dygraphs',
+              'xts','DT', 'rprojroot','sf','leaflet','imager')
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+#set directories
+```{r}
+outDir<-"D:/Flood_Index/Data/Outputs/"
+inDir<-"D:/Flood_Index/Data/Inputs/"
+```
+
+#assign the LPCLOUD STAC Search URL to an object
+```{r}
+search_URL <- 'https://cmr.earthdata.nasa.gov/stac/LPCLOUD/search'
+```
+
+#set the path to your netrc file. This has your login credentials for NASA earthdata.
+```{r}
+source("Functions/earthdata_netrc_setup.R")
+```
+
+
+# Query data that meet your location and time of interest
+#1. list which data products you want to query from. We want both the sentinel and landsat data.
+```{r}
+HLS_col <- list("HLSS30.v2.0", "HLSL30.v2.0") #"VNP46A2", "VJ146A2","VNP21A1D.002","VJ121A1D.002","VNP21A1N.002","VJ121A1N.002"
+```
+
+#2. Set spatial regions of interest
+```{r}
+marsh<-terra::vect(paste0(inDir,"Nests/SALS_breeding_19Apr23.shp"))
+
+marsh_sf<-st_as_sf(marsh)%>%
+  sf::st_transform('+proj=longlat +datum=WGS84')
+```
+
+
+```{r}
+#slice into states to minimize the boundary extents
+marsh_sf_list<-split(marsh_sf,marsh_sf$STATE)
+
+# get the extents for each state
+bb_list<-lapply(marsh_sf_list,st_bbox)
+bb_list<-lapply(bb_list,function(x) paste(x[1], x[2], x[3], x[4], sep = ','))
+bb_list<-bb_list[c("NJ","CT","NH","ME")]
+```
+
+#3. Set time intervals of interest
+```{r}
+#nest data was collected 2010-2021, but HLS only starts in 2013 with landsat 8, get the breeding seasons in these years
+#time query format YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ
+time_list<-list()
+years<-c(2013:2020)
+months<-c("05","06","07","08")
+for(i in 1:length(years)){
+  
+  year_month<-list()
+  
+  for(j in 1:length(months)){
+  year_month[j]<-paste0(years[i],"-",months[j],"-01T00:00:00Z/",years[i],"-",months[j],"-30T00:00:00Z")
+  }
+  
+  time_list[[i]]<-year_month
+}
+
+times<-unlist(time_list)
+  
+```
+
+#4. Submit a seach query based on place and time critera
+```{r}
+#submit a request to the CMR-STAC endpoint using httr package
+#output will show all the available data matching our search criteria
+
+#list to hold the search request outputs for state
+search_req<-vector(mode='list', length=length(bb_list))
+names(search_req)<-names(bb_list)
+
+#for(state in names(bb_list)){
+  #list to hold the search request outputs for each flood event date range within the state
+search_req_list<-list()
+  for(j in 1:length(times)){
+search_body <- list(limit=300,
+                    returned=300,
+                    datetime=times[j],
+                    bbox= bb_list[["NJ"]],
+                    collections= HLS_col)
+
+search_req_list[[j]] <- httr::POST(search_URL, body = search_body, encode = "json") %>% 
+  httr::content(as = "text") %>% 
+  fromJSON()
+  }
+search_req[["NJ"]]<-search_req_list
+
+search_req_list<-list()
+  for(j in 25:length(times)){
+search_body <- list(limit=300,
+                    return=300,
+                    datetime=times[j],
+                    bbox= bb_list[["CT"]],
+                    collections= HLS_col)
+
+search_req_list[[j]]<- httr::POST(search_URL, body = search_body, encode = "json") %>% 
+  httr::content(as = "text") %>% 
+  fromJSON()
+  }
+search_req[["CT"]]<-search_req_list
+
+search_req_list<-list()
+  for(j in 1:length(times)){
+search_body <- list(limit=300,
+                    returned=300,
+                    datetime=times[j],
+                    bbox= bb_list[["NH"]],
+                    collections= HLS_col)
+
+search_req_list[[j]] <- httr::POST(search_URL, body = search_body, encode = "json") %>% 
+  httr::content(as = "text") %>% 
+  fromJSON()
+  }
+search_req[["NH"]]<-search_req_list
+
+search_req_list<-list()
+  for(j in 1:length(times)){
+search_body <- list(limit=300,
+                    returned=300,
+                    datetime=times[j],
+                    bbox= bb_list[["ME"]],
+                    collections= HLS_col)
+
+search_req_list[[j]] <- httr::POST(search_URL, body = search_body, encode = "json") %>% 
+  httr::content(as = "text") %>% 
+  fromJSON()
+  }
+search_req[["ME"]]<-search_req_list
+#}
+
+```
+
+
+
+```{r}
+#check # time intervals that had image results
+sum(unlist(lapply(search_req[["NJ"]],function(x) length(x[["features"]])>0)))
+#check # total image results
+sum(unlist(lapply(search_req[["NJ"]],function(x) nrow(x[["features"]]))))
+
+#check # time intervals that had image results
+sum(unlist(lapply(search_req[["CT"]],function(x) length(x[["features"]])>0)))
+#check # total image results
+sum(unlist(lapply(search_req[["CT"]],function(x) nrow(x[["features"]]))))
+
+sum(unlist(lapply(search_req[["NH"]],function(x) length(x[["features"]])>0)))
+sum(unlist(lapply(search_req[["NH"]],function(x) nrow(x[["features"]]))))
+
+sum(unlist(lapply(search_req[["ME"]],function(x) length(x[["features"]])>0)))
+sum(unlist(lapply(search_req[["ME"]],function(x) nrow(x[["features"]]))))
+```
+
+
+## 5. Subset data by Band
+
+Include visible, NIR, and SWIR bands to look at reflectance distribution for flooded/not flooded nest sites.
+Include Quality (Fmask) layers in the list of links to access.
+
+-   Sentinel 2:
+
+    -   SWIR2 = B12 
+    -   SWIR1 = B11 
+    -   "narrow" NIR = B8A
+    -   Red = B04
+    -   Green = B03
+    -   Blue = B02
+    -   Quality = Fmask
+
+-   Landsat 8:
+
+    -   SWIR2 = B07 or band07
+    -   SWIR1 = B06 or band06
+    -   NIR = B05
+    -   Red = B04 or band04
+    -   Green = B03 or band03
+    -   Blue = B02 or band02
+    -   Thermal 1 = B10
+    -   Thermal 2 = B11
+    -   Quality = Fmask
+
+Below, we'll make a searchable data table of all data product bands that match date ranges within the state regions of interest. The `state_list` object is defined to store these links. Our final step will be a searchable data table!
+
+```{r}
+#flood_search_req is structured as:
+# first divided by state
+# then flood dates within each state
+# then all the data products that matched that date
+
+#loop through all the data products by going state by state, 
+# then date by date to get the features we want to filter for each data product
+state_list <-vector(mode='list', length=length(search_req))
+names(state_list)<-names(search_req)
+
+for(state in names(search_req)){
+  #first state
+search_dates <- search_req[[state]]
+
+  #then date within state
+date_list <- list()
+for(j in 1:length(search_dates)){
+  #get metadata about the images collected within each flood date range in the state region
+search_features<-search_dates[[j]]$features
+
+  # apply image attribute filter to one date range image at a time
+feat_list <- list()
+    #only if images were found
+if(!is.null(nrow(search_features))){
+for(k in 1:nrow(search_features)){
+Feature <- search_features[k,]
+band_list<-list()
+  # FILTER:
+  # 1. Get the visible, NIR, SWIR, and Quality band layer names
+  if (Feature$collection == 'HLSS30_2.0'){
+    bands <- c('B12','B11','B8A','B04','B03','B02','Fmask')
+  }else{
+    bands <- c('B11','B10','B07','B06','B05','B04','B03','B02','Fmask')
+  }
+  for(b in bands){
+    b_assets <- Feature$assets[[b]]$href
+    
+    df <- data.frame(Collection = Feature$collection,                    # Make a data frame including links and other info
+                     Granule_ID = Feature$id,
+                     Cloud_Cover = Feature$properties$`eo:cloud_cover`,
+                     band = b,
+                     Asset_Link = b_assets, stringsAsFactors=FALSE)
+    band_list[[b]] <- df
+  }
+feat_list[[k]] <- do.call(rbind, band_list)
+}
+date_list[[j]]<-do.call(rbind, feat_list)%>%
+  #remove any images with greater than 95% cloud cover
+  filter(Cloud_Cover<95)
+}
+}
+state_list[[state]]<-do.call(rbind,date_list)
+}
+
+# Create a searchable datatable of all bands, from all data products, from all date ranges, from all state regions
+search_df <- do.call(rbind, state_list)
+
+#DT::datatable(search_df)#view the table of bands
+
+save(list=c("search_req","state_list","search_df"),file="Outputs/CT_NJ_NH_ME_bands_All_nest_data.Rdata")
+
+save(list=c("search_req","state_list","search_df"),file="Outputs/CT_bands_All_nest_data.Rdata")
+```

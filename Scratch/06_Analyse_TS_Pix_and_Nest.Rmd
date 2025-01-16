@@ -1,0 +1,1156 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+
+# load packages
+```{r}
+packages <- c('terra','tidyverse','sf','viridis','patchwork')
+invisible(lapply(packages, library, character.only = TRUE))
+library("rje") #expit, logit transformations
+```
+
+# set directories
+```{r}
+outDir<-"D:/Flood_Index/Data/Outputs/"
+inDir<-"D:/Flood_Index/Data/Inputs/"
+```
+# Quality Filtering
+
+Now we should do additional quality filtering.
+
+Unpack the FMask bits to remove all pixels that are cloud, cloud shadow, or cloud dilation OR have high aerosol levels. HLS quality information can be found in section 6.5 of the [HLS V2.0 User Guide](https://lpdaac.usgs.gov/documents/1118/HLS_User_Guide_V2.pdf).
+
+```{r, warning=FALSE}
+#alt formula to unpack FMask bits: floor(floor(pixel/(2^bit#))-(floor(floor(pixel/(2^bit#))/2)*2))
+nests_all_bands<-read.csv(paste0(outDir,"CT_nests_all_HLS_bands.csv"))# at the nest resolution
+file_list<-list.files(path=outDir, pattern = "^CT_nests_bands_cells",full.names = T)
+nests_bands_cells<-do.call('rbind',map(list.files(path=outDir, pattern = "^CT_nests_bands_cells",full.names = T), read.csv)) #at the cell resolution
+
+nests_all_bands_clear<-nests_all_bands%>%
+  rowwise()%>%
+  mutate(bit_str = paste(as.integer(intToBits(FMask)), collapse=""),
+         cloud_shadow=ifelse(substr(bit_str, 2, 2) == '1'|substr(bit_str, 3, 3) == '1'|substr(bit_str, 4, 4) == '1',1,0),
+         clear=ifelse(substr(bit_str, 7, 8) == '01'|substr(bit_str, 7, 8) == '00'|substr(bit_str, 7, 8) == '10',1,0), #exclude high aerosol levels (11)
+         water=ifelse(substr(bit_str, 6, 6) == '1',1,0))%>%
+      #remove cloud/shadow and high aerosol pixels
+  ungroup()%>%
+  filter(cloud_shadow==0&clear==1)
+
+nests_bands_cells_clear<-nests_bands_cells%>%
+  rowwise()%>%
+  mutate(bit_str = paste(as.integer(intToBits(FMask)), collapse=""),
+         cloud_shadow=ifelse(substr(bit_str, 2, 2) == '1'|substr(bit_str, 3, 3) == '1'|substr(bit_str, 4, 4) == '1',1,0),
+         clear=ifelse(substr(bit_str, 7, 8) == '01'|substr(bit_str, 7, 8) == '00'|substr(bit_str, 7, 8) == '10',1,0), #exclude high aerosol levels (11)
+         water=ifelse(substr(bit_str, 6, 6) == '1',1,0))%>%
+      #remove cloud/shadow and high aerosol pixels
+  ungroup()%>%
+  filter(cloud_shadow==0&clear==1&!(FMask>165|(FMask<120&FMask>100)|(FMask>70&FMask<90)|FMask<64))#temp fix until undoing fmask averaging in band sampling script
+
+#write.csv(nests_all_bands_clear,paste0(outDir,"CT_nests_all_HLS_bands_clear.csv"),row.names=F)
+```
+
+
+# Transform each metric into a binary flood indicator
+```{r}
+# we have already identified wet pixels via CFMask
+
+#Now calculate FLATS, TC Wetness, as well as the NDWI and Phenology indices used to create FLATS
+nests_all_bands_clear<-nests_all_bands_clear%>%
+  mutate(pheno=(Green-Red)/(Green+Red),
+         NDWI=(Red-SWIR1)/(Red+SWIR1),
+         FLATS=expit(-1.6+20*NDWI+68.6*pheno),
+         NDWI=(Green-SWIR1)/(Green+SWIR1),
+         TCWet=(0.1509*Blue)+(0.1973*Green)+(0.3283*Red)+(0.3407*NIR)-(0.7117*SWIR1)-(0.4559*SWIR2)
+         )
+
+nests_bands_cells_clear<-nests_bands_cells_clear%>%
+  mutate(pheno=(Green-Red)/(Green+Red),
+         NDWI=(Red-SWIR1)/(Red+SWIR1),
+         FLATS=expit(-1.6+20*NDWI+68.6*pheno),
+         NDWI=(Green-SWIR1)/(Green+SWIR1),
+         TCWet=(0.1509*Blue)+(0.1973*Green)+(0.3283*Red)+(0.3407*NIR)-(0.7117*SWIR1)-(0.4559*SWIR2)
+         )
+
+```
+
+# Divide into successful and unsuccessful/flood failed nests
+```{r}
+#get nest information for the nest-level time series
+nest_locations<-read.csv(paste0(inDir,"Nests/nest_locations_01_3_23.csv"))%>%
+  rename(nest_id=id,site=Site,year=Year)%>%
+  # Add nest identifying columns
+  #add site names
+  mutate(site=substr(nest_id,start=1,stop=2),
+         #add nest number
+         nest_num=as.numeric(substr(nest_id,(nchar(nest_id)-2),nchar(nest_id))))
+
+fates<-read.csv(paste0(inDir,"Nests/NestFates_2001-2020.csv"),na.strings=c("","NOT REC","NA"))%>%
+  #select and format variables
+  dplyr::select("nest_id"="SHARPNestID","UltimateNestFate","FirstEggDate"="EstFirstEggDate",
+                "maxeggs"="MaxNumEggs","Nsuccess"="NumFledged",
+                "NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                "NumChicksFlooded","NumChicksFloodedMissing",
+                "NumEggsDepredated", "NumEggsDepredatedMissing","NumChicksDepredated","NumChicksDepredatedMissing")%>%
+  mutate(across(c("NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                  "NumChicksFlooded","NumChicksFloodedMissing","maxeggs","Nsuccess",
+                  "NumEggsDepredated", "NumEggsDepredatedMissing","NumChicksDepredated","NumChicksDepredatedMissing"),
+                as.numeric))%>%
+  # Add nest identifying columns
+  mutate(year=as.numeric(paste0("20",substr(nest_id,start=3,stop=4))),
+         #add site names
+         site=substr(nest_id,start=1,stop=2),
+         #add nest number
+         nest_num=as.numeric(substr(nest_id,(nchar(nest_id)-2),nchar(nest_id))))%>%
+  # Format fate response variables
+  rowwise()%>%
+  # 1. proportion nestlings lost to flooding
+  mutate(flooded_cont=sum(c(NumEggsFloodedInNest,NumEggsFloodedFromNest,NumEggsFloodedMissing,
+                            NumChicksFlooded,NumChicksFloodedMissing),na.rm = T),
+         flooded_prop=round(flooded_cont/maxeggs,2),
+         # 2. Probability nest failed/was successful in general
+         fate=case_when(
+           UltimateNestFate%in%c("FLEDGED")~1,
+           UltimateNestFate%in%c("DEPREDATED","FLOODED","FLOODED/DEPREDATED","NEVER HAD EGGS","NEVER HAD","FAIL UNKNOWN")~0,
+           !(UltimateNestFate%in%c("FLEDGED","DEPREDATED","FLOODED","FLOODED/DEPREDATED",
+                                   "NEVER HAD EGGS","NEVER HAD","FAIL UNKNOWN"))~NA),
+         # 3. Probability nest failed due to flooding
+         flooded_fate=ifelse(UltimateNestFate%in%c("FLOODED","FLOODED/DEPREDATED"),1,0))%>%
+  ungroup()%>%
+  select(nest_id,FirstEggDate, year, site, nest_num, flooded_prop,fate,flooded_fate,maxeggs,flooded_cont)
+
+  #set all fate variables to NA for nests with NA for ultimate nest fate
+fates[is.na(fates$fate),c(6,8)]<-NA
+fates[is.nan(fates$flooded_prop),6]<-NA
+
+nests<-left_join(nest_locations,fates,by=c("nest_id","year","site","nest_num"))%>%
+  distinct(nest_id,.keep_all = T)%>%
+  mutate(FirstEggDate=mdy(FirstEggDate))%>%
+  filter(Species=="SALS",State=="CT",year>=2013)
+
+#join nest information to nest-level time series
+nests_bands_fates<-nests_all_bands_clear%>%
+  left_join(nests,by=c("nest_id","site","year"))%>%
+  select(-bit_str)%>%
+  mutate(img_year=year(Date),
+         img_month=month(Date),
+         # 1 means success, 0 means flood-failed, remove all other fates (predation)
+         flooded_fate=case_when(
+           flooded_fate==1~0,
+           fate==1~1,
+           flooded_fate!=1&fate!=1~NA),
+         flooded_fate_char=ifelse(flooded_fate==1,"Successful","Flood-Failed"))%>% 
+  #remove observations missing fate info or not flood related
+  filter(!(is.na(flooded_fate)))%>%
+  #take the average across nest SR values collected on the same date
+  group_by(nest_id,site,year,Date)%>%
+  summarise(across(c(Blue:SWIR2,water,NDWI:TCWet,nest_num:img_month),mean,na.rm=T),
+            across(c(flooded_fate_char),first))%>%
+  ungroup()
+
+#make some binary responses for the 30m level time series
+cells_bands_fates<-nests_bands_cells_clear%>%
+  mutate(prop_succ=n_nests_suc_5/n_nests_3,
+         fate_char=ifelse(prop_succ==1,"Successful","Failed"),
+         fate=ifelse(prop_succ==1,1,0),
+         prop_flood=n_nests_flood_4/n_nests_3,
+         flooded_fate_char=ifelse(prop_flood==1,"Flood-Failed","Not Flood-Failed"),
+         flooded_fate=ifelse(prop_flood==1,0,1),#changed to probability a nest does not flood fail
+         filter_flag=case_when( # remove all cells without any successful or flood-failed nests
+           (n_nests_flood_4==0&n_nests_suc_5==0)~1,
+           (n_nests_flood_4!=0|n_nests_suc_5!=0)~0,
+           (is.na(n_nests_suc_5)&is.na(n_nests_flood_4))~1))%>%
+  #remove observations missing fate info and compilation error (fix this)
+  filter(filter_flag!=1&date!="SWIR1")%>%
+  mutate(img_year=year(date),
+         img_month=month(date))
+```
+
+
+# Summarize what information we have
+```{r}
+#how many nests have images?
+length(unique(nests_bands_fates$nest_id))
+#how many cells have nests
+length(unique(cells_bands_fates$cell_ID))
+
+#how many dates does each nest site have images for?
+date_count_nest<-nests_bands_fates%>%
+  count(nest_id)
+date_plot1<-ggplot()+
+  geom_histogram(data=date_count_nest,aes(x=n))+
+  theme_bw(base_size = 12)+
+  labs(x="Number of Dates in Time Series",y="Number of Nest Locations (Total N= 227)")
+
+date_count_cell<-cells_bands_fates%>%
+  count(cell_ID)
+date_plot2<-ggplot()+
+  geom_histogram(data=date_count_cell,aes(x=n))+
+  theme_bw(base_size = 12)+
+  labs(x="Number of Clear Pixel Dates in Time Series",y="Number of Pixels with Nests")
+
+(date_plot1/date_plot2)+plot_layout(axis_titles="collect")
+date_plot1
+ggsave(filename = paste0(outDir,"Figures/TS_Density_nests.jpeg"), width = 5, height=5, dpi = "retina")
+
+# How many years have images and how many images per year?
+distinct_months_years<-nests_bands_fates%>%
+  group_by(nest_id,img_year,img_month)%>%
+  summarize(month=first(img_month),
+            month_count=n())%>%
+  ungroup()%>%
+  complete(img_year,month)%>%
+  mutate(month_count=ifelse(is.na(month_count),0,month_count),
+         date=paste(month,img_year,sep="-"),
+         date=my(date),
+         date=factor(format(as.Date(date),"%b-%Y"),levels=c("May-2013", "Jun-2013", "Jul-2013", "Aug-2013",
+                                                               "May-2014", "Jun-2014", "Jul-2014", "Aug-2014",
+                                                               "May-2015", "Jun-2015", "Jul-2015", "Aug-2015",
+                                                               "May-2016", "Jun-2016", "Jul-2016", "Aug-2016",
+                                                               "May-2017", "Jun-2017", "Jul-2017", "Aug-2017",
+                                                               "May-2018", "Jun-2018", "Jul-2018", "Aug-2018",
+                                                               "May-2019", "Jun-2019", "Jul-2019", "Aug-2019",
+                                                               "May-2020", "Jun-2020", "Jul-2020", "Aug-2020")))
+
+date_plot3<-ggplot(distinct_months_years,aes(x=date,fill=as.factor(month_count)))+
+  geom_bar(position="stack",stat = "count")+
+  scale_fill_brewer(palette = "Purples")+
+  theme_bw(base_size = 12)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(fill="Number of Clear Pixel Dates",x="Date",y="Number of Nest Locations (Total N= 227)")
+
+distinct_months_years<-cells_bands_fates%>%
+  group_by(cell_ID,img_year)%>%
+  summarize(months=n_distinct(img_month))%>%
+  ungroup()
+
+date_plot4<-ggplot(distinct_months_years,aes(x=img_year,fill=as.factor(months)))+
+  geom_bar(position="dodge",stat = "count")+
+  scale_fill_brewer(palette = "Purples")+
+  theme_bw(base_size = 12)+
+  labs(fill="Number of Months\n with Clear Pixels",x="Year",y="Number of Pixels with Nests")
+
+(date_plot3/date_plot4)+plot_layout(guides="collect",axis_titles="collect")
+date_plot3
+ggsave(filename = paste0(outDir,"Figures/TS_Distribution_nests.jpeg"), width = 10, height=4, dpi = "retina")
+
+
+# What are the distributions of each nest fate response?
+dist_plot1<-ggplot(data=nests_bands_fates%>%
+         filter(flooded_prop<=1)%>%
+         pivot_longer(cols=c("fate","flooded_fate","flooded_prop"),
+               names_to = "response",values_to = "value"))+
+  geom_histogram(aes(x=value))+
+  facet_wrap(~response)+
+  theme_bw(base_size = 12)
+
+dist_plot2<-ggplot(data=cells_bands_fates%>%
+         filter(flooded_prop_max_1<=1)%>%
+         pivot_longer(cols=c("fate","flooded_fate","prop_succ","prop_flood","flooded_prop_max_1","flooded_prop_mean_2"),
+               names_to = "response",values_to = "value"))+
+  geom_histogram(aes(x=value))+
+  facet_wrap(~response)+
+  theme_bw(base_size = 12)
+
+dist_plot1/dist_plot2
+ggsave(filename = paste0(outDir,"Figures/Response_Distribution.jpeg"), width = 6, height=7, dpi = "retina")
+```
+
+
+# Visual Analysis
+
+## What is the average and variance in band and wet index value per nest site TS?
+#--------------------------------------------------------------------------------------
+```{r}
+### Discrete Nest Fate Variables
+
+# Nest-Resolution
+#-------------------------------------------------------------------------
+nest_avgs<-nests_bands_fates%>%
+  mutate(flooded_prop=ifelse(flooded_prop>1,1,flooded_prop))%>%
+  group_by(nest_id,site,year)%>%
+  summarise(across(c(Blue:SWIR2,water:TCWet), mean, na.rm=T),
+            across(c(flooded_fate_char,flooded_fate,flooded_prop),first))
+nest_sd<-nests_bands_fates%>%
+  filter(!is.na(fate))%>%
+  mutate(flooded_prop=ifelse(flooded_prop>1,1,flooded_prop))%>%
+  group_by(nest_id,site,year)%>%
+  summarise(across(c(Blue:SWIR2,water:TCWet), var, na.rm=T),
+            across(c(flooded_fate_char,flooded_fate,flooded_prop),first))
+
+#how does the band average value vary between fates?
+p1<-ggplot(pivot_longer(nest_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"), aes(x=SR, group=flooded_fate_char, fill=flooded_fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(fill="Nest Fate",x="Mean Value 2013-2020",y="Density of Nest Locations")
+#how does the wet index avg value vary between fates
+p2<-ggplot(pivot_longer(nest_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"), aes(x=Value,group=flooded_fate_char,fill=flooded_fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(fill="Nest Fate",x="Mean Value 2013-2020",y="Density of Nest Locations")
+
+#how does the band variance vary between fates?
+p3<-ggplot(pivot_longer(nest_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"), aes(x=SR,group=flooded_fate_char,fill=flooded_fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(fill="Nest Fate",x="Variance 2013-2020",y="Density of Nest Locations")
+
+#how does the wet index sd vary between fates
+p4<-ggplot(pivot_longer(nest_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"), aes(x=Value,group=flooded_fate_char,fill=flooded_fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(fill="Nest Fate",x="Variance 2013-2020",y="Density of Nest Locations")
+
+# at the nest resolution, successful nests dont seem to differ in mean reflectance of water index over time. 
+# They have slightly lower green and higher red variance over time.
+((p1+p2+plot_layout(axis_titles="collect"))/(p3+p4+plot_layout(axis_titles="collect")))+plot_layout(guides = "collect")
+ggsave(filename = paste0(outDir,"Figures/FloodedFate_Mean_Var_Distrib.jpeg"), width = 12, height=7, dpi = "retina")
+
+
+
+
+# Cell-Resolution
+#----------------------------------------------------------------------------------
+cell_avgs<-cells_bands_fates%>%
+  mutate(flooded_prop_max_1=ifelse(flooded_prop_max_1>1,1,flooded_prop_max_1),
+         flooded_prop_mean_2=ifelse(flooded_prop_mean_2>1,1,flooded_prop_mean_2))%>%
+  group_by(cell_ID)%>%
+  summarise(across(c(Blue,Green:SWIR2,water:TCWet), mean,na.rm=T),
+            across(c(fate_char,flooded_fate_char,prop_flood,prop_succ,flooded_prop_mean_2,flooded_prop_max_1),first))
+cell_sd<-cells_bands_fates%>%
+  mutate(flooded_prop_max_1=ifelse(flooded_prop_max_1>1,1,flooded_prop_max_1),
+         flooded_prop_mean_2=ifelse(flooded_prop_mean_2>1,1,flooded_prop_mean_2))%>%
+  group_by(cell_ID)%>%
+  summarise(across(c(Blue,Green:SWIR2,water:TCWet), var,na.rm=T),
+            across(c(fate_char,flooded_fate_char,prop_flood,prop_succ,flooded_prop_mean_2,flooded_prop_max_1),first))
+
+#how does the band average value vary between fates?
+p5<-ggplot(pivot_longer(cell_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"), aes(x=SR, group=fate_char, fill=fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(fill="Nest Fate",x="Mean Value 2013-2020",y="Density of Nest Pixels")
+#how does the wet index avg value vary between fates?
+p6<-ggplot(pivot_longer(cell_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"), aes(x=Value,group=fate_char,fill=fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(fill="Nest Fate",x="Mean Value 2013-2020",y="Density of Nest Pixels")
+
+#how does the band variance vary between fates?
+p7<-ggplot(pivot_longer(cell_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"), aes(x=SR,group=fate_char,fill=fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(fill="Nest Fate",x="Variance 2013-2020",y="Density of Nest Pixels")
+#how does the wet index variance vary between fates?
+p8<-ggplot(pivot_longer(cell_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"), aes(x=Value,group=fate_char,fill=fate_char)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(fill="Nest Fate",x="Variance 2013-2020",y="Density of Nest Pixels")
+
+# at the cell resolution, successful nests seem to have lower average NIR and SWIR and lower average NDWI/TCWET. 
+# They also have less variance in TC Wet.
+((p5+p6+plot_layout(axis_titles="collect"))/(p7+p8+plot_layout(axis_titles="collect")))+plot_layout(guides = "collect")
+ggsave(filename = paste0(outDir,"Figures/PixFate_Mean_Var_Distrib.jpeg"), width = 12, height=7, dpi = "retina")
+
+
+t<-cell_avgs%>%
+  group_by(fate_char)%>%
+  summarise(across(Blue:TCWet, mean))%>%
+  ungroup()%>%
+  summarise(across(Blue:TCWet, diff))
+
+```
+
+
+```{r}
+#### Continuous Nest Fate Variables
+
+# nest resolution
+#----------------------------------------------------------------------------------------
+s1<-ggplot(pivot_longer(nest_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Mean 2013-2020",x="")
+s2<-ggplot(pivot_longer(nest_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Mean 2013-2020",x="")
+s3<-ggplot(pivot_longer(nest_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nest Contents Flooded")
+s4<-ggplot(pivot_longer(nest_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nest Contents Flooded")
+((s2+s1+plot_layout(axis_titles = "collect"))/(s4+s3+plot_layout(axis_titles = "collect")))
+ggsave(filename = paste0(outDir,"Figures/NestPropFlood_Mean_Var_Distrib.jpeg"), width = 12, height=7, dpi = "retina")
+```
+
+```{r}
+# Pixel Resolution
+#----------------------------------------------------------------------------------------
+  # means 
+    # proportion successful nests
+s5<-ggplot(pivot_longer(cell_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=prop_flood,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Mean 2013-2020",x="Proportion Nests Flooded per Pixel")
+s6<-ggplot(pivot_longer(cell_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=prop_flood,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Mean 2013-2020",x="Proportion Nests Flooded per Pixel")
+      # proportion flooded nests
+s9<-ggplot(pivot_longer(cell_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=prop_succ,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Mean 2013-2020",x="Proportion Nests Successful per Pixel")
+s10<-ggplot(pivot_longer(cell_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=prop_succ,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Mean 2013-2020",x="Proportion Nests Successful per Pixel")
+    # mean proportion flooded contents
+s13<-ggplot(pivot_longer(cell_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop_mean_2,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Mean 2013-2020",x="Mean Proportion Nest Contents Lost to Flood per Pixel")
+s14<-ggplot(pivot_longer(cell_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop_mean_2,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Mean 2013-2020",x="Mean Proportion Nest Contents Lost to Flood per Pixel")
+    # max proportion flooded contents
+s17<-ggplot(pivot_longer(cell_avgs,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop_max_1,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Mean 2013-2020",x="Max Proportion Nest Contents Lost to Flooding per Pixel")
+s18<-ggplot(pivot_longer(cell_avgs,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop_max_1,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Mean 2013-2020",x="Max Proportion Nest Contents Lost to Flooding per Pixel")
+
+
+  # variance for bands and indices
+s7<-ggplot(pivot_longer(cell_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=prop_flood,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nests Flooded per Pixel")
+s8<-ggplot(pivot_longer(cell_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=prop_flood,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nests Flooded per Pixel")
+  
+s11<-ggplot(pivot_longer(cell_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=prop_succ,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nests Successful per Pixel")
+s12<-ggplot(pivot_longer(cell_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=prop_succ,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Variance 2013-2020",x="Proportion Nests Successful per Pixel")
+
+s15<-ggplot(pivot_longer(cell_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop_mean_2,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Variance 2013-2020",x="Mean Proportion Nest Contents Lost to Flooding per Pixel")
+s16<-ggplot(pivot_longer(cell_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop_mean_2,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Variance 2013-2020",x="Mean Proportion Nest Contents Lost to Flooding per Pixel")
+
+s19<-ggplot(pivot_longer(cell_sd,cols = c("water","NDWI","FLATS","TCWet"),names_to = "Index",values_to = "Value"),aes(x=flooded_prop_max_1,y=Value))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "glm", se = T)+
+  theme_classic()+
+  facet_wrap(~Index, scales = "free")+
+  labs(y="Variance 2013-2020",x="Max Proportion Nest Contents Lost to Flooding per Pixel")
+s20<-ggplot(pivot_longer(cell_sd,cols = c("Blue":"SWIR2"),names_to = "Band",values_to = "SR"),aes(x=flooded_prop_max_1,y=SR))+#flooded_fate
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_classic()+
+  facet_wrap(~Band, scales = "free")+
+  labs(y="Variance 2013-2020",x="Max Proportion Nest Contents Lost to Flooding per Pixel")
+
+
+(s6+s5+plot_layout(axis_titles = "collect"))/(s8+s7+plot_layout(axis_titles = "collect"))
+
+(s10+s9+plot_layout(axis_titles = "collect"))/(s12+s11+plot_layout(axis_titles = "collect"))
+
+(s14+s13+plot_layout(axis_titles = "collect"))/(s16+s15+plot_layout(axis_titles = "collect"))
+
+(s18+s7+plot_layout(axis_titles = "collect"))/(s20+s19+plot_layout(axis_titles = "collect"))
+
+ggsave(filename = paste0(outDir,"Figures/PixPropSuccess_Mean_Var_Distrib.jpeg"), width = 12, height=7, dpi = "retina")
+```
+
+
+## visualize time series for each band and water index for successful and unsuccessful nests
+#---------------------------------------------------------------------------------------------------
+```{r}
+# Nest resolution
+success<-nests_bands_fates%>%
+  filter(flooded_fate==1)%>%
+  group_by(Date,nest_id)%>%
+  summarise_at(vars(Blue:TCWet), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "SR")
+failed<-nests_bands_fates%>%
+  filter(flooded_fate==0)%>%
+  group_by(Date,nest_id)%>%
+  summarise_at(vars(Blue:TCWet), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "SR")
+
+
+ts1<-ggplot()+
+  geom_line(data=failed%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")), aes(x=ymd(Date),y=SR,group=nest_id,color="Flood-Failed"))+
+  geom_line(data=success%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")),aes(x=ymd(Date),y=SR,group=nest_id,color="Successful"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Index Value",color="Nest Fate")+
+  facet_wrap(~Band)
+ts2<-ggplot()+
+  geom_line(data=failed%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")), aes(x=ymd(Date),y=SR,group=nest_id,color="Flood-Failed"))+
+  geom_line(data=success%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")),aes(x=ymd(Date),y=SR,group=nest_id,color="Successful"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Surface Reflectance",color="Nest Fate")+
+  facet_wrap(~Band)
+
+ts1+ts2+plot_layout(guides="collect",axis_titles = "collect")
+ggsave(filename = paste0(outDir,"Figures/NestFloodFailed_TS.jpeg"), width = 12, height=5, dpi = "retina")
+
+flooded<-nests_bands_fates%>%
+  filter(flooded_fate==0)%>%
+  group_by(Date,nest_id)%>%
+  summarise_at(vars(Blue:TCWet), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "Value")
+notflooded<-nests_bands_fates%>%
+  filter(flooded_fate==1)%>%
+  group_by(Date,nest_id)%>%
+  summarise_at(vars(Blue:TCWet), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "Value")
+
+
+ts3<-ggplot()+
+  geom_line(data=flooded%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")), aes(x=ymd(Date),y=Value,group=nest_id,color="Flood-Failed"))+
+  geom_line(data=notflooded%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")),aes(x=ymd(Date),y=Value,group=nest_id,color="Not Flood-Failed"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Index Value",color="Nest Fate")+
+  facet_wrap(~Band)
+ts4<-ggplot()+
+  geom_line(data=flooded%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")), aes(x=ymd(Date),y=Value,group=nest_id,color="Flood-Failed"))+
+  geom_line(data=notflooded%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")),aes(x=ymd(Date),y=Value,group=nest_id,color="Not Flood-Failed"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Surface Reflectance",color="Nest Fate")+
+  facet_wrap(~Band)
+
+ts3+ts4+plot_layout(guides="collect",axis_titles = "collect")
+```
+
+```{r}
+# Cell resolution
+success<-cells_bands_fates%>%
+  filter(fate==1)%>%
+  group_by(date,cell_ID)%>%
+  summarise_at(vars(c(Blue,Green:SWIR2,water,NDWI:TCWet)), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "SR")
+failed<-cells_bands_fates%>%
+  filter(fate==0)%>%
+  group_by(date,cell_ID)%>%
+  summarise_at(vars(c(Blue,Green:SWIR2,water,NDWI:TCWet)), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "SR")
+
+
+ts5<-ggplot()+
+  geom_line(data=failed%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")), aes(x=ymd(date),y=SR,group=cell_ID,color="Failed"))+
+  geom_line(data=success%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")),aes(x=ymd(date),y=SR,group=cell_ID,color="Successful"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Index Value",color="Nest Fate")+
+  facet_wrap(~Band)
+ts6<-ggplot()+
+  geom_line(data=failed%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")), aes(x=ymd(date),y=SR,group=cell_ID,color="Failed"))+
+  geom_line(data=success%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")),aes(x=ymd(date),y=SR,group=cell_ID,color="Successful"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Surface Reflectance",color="Nest Fate")+
+  facet_wrap(~Band)
+
+ts5+ts6+plot_layout(guides="collect",axis_titles = "collect")
+ggsave(filename = paste0(outDir,"Figures/PixSuccess_TS.jpeg"), width = 12, height=5, dpi = "retina")
+
+flooded<-cells_bands_fates%>%
+  filter(flooded_fate==0)%>%
+  group_by(date,cell_ID)%>%
+  summarise_at(vars(c(Blue,Green:SWIR2,water,NDWI:TCWet)), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "Value")
+notflooded<-cells_bands_fates%>%
+  filter(flooded_fate==1)%>%
+  group_by(date,cell_ID)%>%
+  summarise_at(vars(c(Blue,Green:SWIR2,water,NDWI:TCWet)), mean, na.rm=T)%>%
+  pivot_longer(cols = c("Blue":"TCWet"),names_to = "Band",values_to = "Value")
+
+
+ts7<-ggplot()+
+  geom_line(data=flooded%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")), aes(x=ymd(date),y=Value,group=cell_ID,color="Flood-Failed"))+
+  geom_line(data=notflooded%>%filter(Band%in%c("water","TCWet","NDWI","FLATS")),aes(x=ymd(date),y=Value,group=cell_ID,color="Not Flood-Failed"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Index Value",color="Nest Fate")+
+  facet_wrap(~Band)
+ts8<-ggplot()+
+  geom_line(data=notflooded%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")), aes(x=ymd(date),y=Value,group=cell_ID,color="Not Flood-Failed"))+
+  geom_line(data=flooded%>%filter(Band%in%c("Red","Green","Blue","NIR","SWIR1","SWIR2")),aes(x=ymd(date),y=Value,group=cell_ID,color="Flood-Failed"))+
+  theme_bw(base_size = 12)+
+  labs(x="Date",y="Surface Reflectance",color="Nest Fate")+
+  facet_wrap(~Band)
+
+ts8+ts7+plot_layout(guides="collect",axis_titles = "collect")
+#ggsave(filename = paste0(outDir,"Figures/PixFlooded_TS.jpeg"), width = 12, height=5, dpi = "retina")
+```
+
+
+
+## Visualize spectral distributions between successful and unsuccessful nests
+#-------------------------------------------------------------------------------------------
+```{r}
+upper.95.ci<-function(col){
+  mean(col,na.rm=T)+(1.96*(sd(col,na.rm=T)/(sqrt(length(col)))))
+}
+lower.95.ci<-function(col){
+  mean(col,na.rm=T)-(1.96*(sd(col,na.rm=T)/(sqrt(length(col)))))
+}
+mean.narm<-function(col){
+  mean(col,na.rm=T)
+}
+
+#Nest resolution
+
+#No noticeable difference in spectral distribution of successful/unsuccessful nests
+success_band_sum<-nests_bands_fates%>%
+  group_by(flooded_fate_char)%>%
+  summarise(across(Blue:SWIR2, list(mean=mean,uc= upper.95.ci, lc=lower.95.ci)))%>%
+  ungroup()%>%
+  pivot_longer(cols = 2:ncol(.),names_to = c("Band","Stat"),names_sep = "_",values_to = "Value")%>%
+  pivot_wider(names_from = "Stat",values_from = "Value")%>%
+  mutate(Band=factor(Band,levels=c("Blue","Green","Red","NIR","SWIR1","SWIR2")))
+
+sd1<-ggplot(data=success_band_sum,aes(x=Band,y=mean,group=flooded_fate_char))+
+  geom_ribbon(aes(ymin=lc,ymax=uc,fill=flooded_fate_char),alpha=0.3)+
+  geom_line(aes(color=flooded_fate_char))+
+  theme_bw(base_size=12)+
+  labs(x="Spectral Band (Wavelength)",y="Average Surface Refectance 2013-2020",fill="Nest Fate",color="Nest Fate")
+
+# Slightly lower reflectance in the SWIR bands for flood-failed nests.
+flood_band_sum<-nests_bands_fates%>%
+  group_by(flooded_fate_char)%>%
+  summarise(across(Blue:SWIR2, list(mean=mean,uc= upper.95.ci, lc=lower.95.ci)))%>%
+  ungroup()%>%
+  pivot_longer(cols = 2:ncol(.),names_to = c("Band","Stat"),names_sep = "_",values_to = "Value")%>%
+  pivot_wider(names_from = "Stat",values_from = "Value")%>%
+  mutate(Band=factor(Band,levels=c("Blue","Green","Red","NIR","SWIR1","SWIR2")))
+
+sd2<-ggplot(data=flood_band_sum,aes(x=Band,y=mean,group=flooded_fate_char))+
+  geom_ribbon(aes(ymin=lc,ymax=uc,fill=flooded_fate_char),alpha=0.3)+
+  geom_line(aes(color=flooded_fate_char))+
+  theme_bw(base_size=12)+
+  labs(x="Spectral Band (Wavelength)",y="Average Surface Refectance 2013-2020",fill="Nest Fate",color="Nest Fate")
+
+sd1+sd2+plot_layout(axis_titles = "collect")
+sd1
+ggsave(filename = paste0(outDir,"Figures/FloodedNest_Spectral_Distributions.jpeg"), width = 7, height=5, dpi = "retina")
+```
+
+```{r}
+#Nest resolution
+
+#No noticeable difference in spectral distribution of successful/unsuccessful nests
+success_band_sum<-cells_bands_fates%>%
+  group_by(fate_char)%>%
+  summarise(across(c(Blue,Green:SWIR2), list(mean=mean.narm,uc= upper.95.ci, lc=lower.95.ci)))%>%
+  ungroup()%>%
+  pivot_longer(cols = 2:ncol(.),names_to = c("Band","Stat"),names_sep = "_",values_to = "Value")%>%
+  pivot_wider(names_from = "Stat",values_from = "Value")%>%
+  mutate(Band=factor(Band,levels=c("Blue","Green","Red","NIR","SWIR1","SWIR2")))
+
+sd3<-ggplot(data=success_band_sum,aes(x=Band,y=mean,group=fate_char))+
+ geom_ribbon(aes(ymin=lc,ymax=uc,fill=fate_char),alpha=0.3)+
+  geom_line(aes(color=fate_char))+
+  theme_bw(base_size=12)+
+  labs(x="Spectral Band (Wavelength)",y="Average Surface Refectance 2013-2020",fill="Nest Fate",color="Nest Fate")
+
+# Slightly lower reflectance in the SWIR bands for flood-failed nests.
+flood_band_sum<-cells_bands_fates%>%
+  group_by(flooded_fate_char)%>%
+  summarise(across(c(Blue,Green:SWIR2), list(mean=mean.narm,uc= upper.95.ci, lc=lower.95.ci)))%>%
+  ungroup()%>%
+  pivot_longer(cols = 2:ncol(.),names_to = c("Band","Stat"),names_sep = "_",values_to = "Value")%>%
+  pivot_wider(names_from = "Stat",values_from = "Value")%>%
+  mutate(Band=factor(Band,levels=c("Blue","Green","Red","NIR","SWIR1","SWIR2")))
+
+sd4<-ggplot(data=flood_band_sum,aes(x=Band,y=mean,group=flooded_fate_char))+
+  geom_ribbon(aes(ymin=lc,ymax=uc,fill=flooded_fate_char),alpha=0.3)+
+  geom_line(aes(color=flooded_fate_char))+
+  theme_bw(base_size=12)+
+  labs(x="Spectral Band (Wavelength)",y="Average Surface Refectance 2013-2020",fill="Nest Fate",color="Nest Fate")
+
+sd3+sd4+plot_layout(axis_titles = "collect")
+ggsave(filename = paste0(outDir,"Figures/Pix_Spectral_Distributions.jpeg"), width = 10, height=5, dpi = "retina")
+
+```
+
+
+# Statistical Analysis
+```{r}
+library(lme4)
+library(glmmTMB)
+library(car)
+library(bbmle)
+library(DHARMa)
+library(broom.mixed)
+library(ggstats)
+
+# format the data for stats analyses
+nest_modeling<-nests_bands_fates%>%
+  group_by(nest_id)%>%
+  summarise(across(c(Blue:SWIR2,water,NDWI:TCWet), list(mean=mean, var= var)),
+            across(c(flooded_prop,flooded_cont,maxeggs,site), first))%>%
+  ungroup()
+
+
+pixel_modeling<-cells_bands_fates%>%
+  group_by(cell_ID)%>%
+  summarise(across(c(Blue,Green:SWIR2,water,NDWI:TCWet), list(mean=~mean(.x,na.rm=T), var= ~var(.x,na.rm=T))),
+            across(c(prop_succ,fate,prop_flood,flooded_fate,n_nests_3,n_nests_suc_5,n_nests_flood_4,flooded_prop_max_1,flooded_prop_mean_2), first))%>%
+  ungroup()
+```
+
+## Test for statistically significant differences between mean and variance in SR time series for binary nest responses.
+```{r}
+# Are the variances between successful/unsuccessful nests sig different?
+  # compare whether the mean variance of successful nests is lower than mean variance of unsuccessful/flooded nests
+results_list1<-list()
+comparison_list<-c("mean","var")
+
+n_results<-length(nest_modeling%>%select(ends_with(comparison_list[j])))  
+results1<-data.frame(Response=rep(NA,n_results),Variable=rep(NA,n_results),Type=rep(NA,n_results),Difference=rep(NA,n_results), p.Value=rep(NA,n_results))
+
+for(j in 1:length(comparison_list)){
+
+  # use a two sample t-test because our treatment (success/not success) is independent across samples (you cant have both at one nest)
+    #check if normally distributed
+      #if any > than 0.05, normal. If all not normal, apply levenes test of equal variance.
+if(all(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])), 2, function(x) shapiro.test(x)$p.value))<0.05)){
+      # levenes test p value less than 0.05 means the variances are different. > means they're equal
+equal.pix.fate<-all(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) car::leveneTest(x~as.factor(fate),data=pixel_modeling)[1,3]>0.05)))
+equal.pix.floodfate<-all(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) car::leveneTest(x~as.factor(flooded_fate),data=pixel_modeling)[1,3]>0.05)))
+}
+
+if(all(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])), 2, function(x) shapiro.test(x)$p.value))<0.05)){
+equal.nest.fate<-all(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) car::leveneTest(x~as.factor(fate),data=nest_modeling)[1,3]>0.05)))
+equal.nest.floodfate<-all(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) car::leveneTest(x~as.factor(flooded_fate),data=nest_modeling)[1,3]>0.05)))
+}
+
+    #use standard t-test if they have the same variance/mean (set var.equal=T), welch's t-test, if different, is the default
+if(equal.pix.fate==T){
+  
+      # collect the differences in mean between successful and failed nests (failed-success, so expect neg if success is larger and pos if flooded is lower)
+results1$Difference <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(fate),data=pixel_modeling,var.equal=T)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=pixel_modeling,var.equal=T)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=pixel_modeling,var.equal=T)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("All Nests Successful in Pixel",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+
+}else{
+  
+results1$Difference <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(fate),data=pixel_modeling)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=pixel_modeling)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=pixel_modeling)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("All Nests Successful in Pixel",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+
+}
+
+if(equal.pix.floodfate==T){
+  
+results1$Difference <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(flooded_fate),data=pixel_modeling,var.equal=T)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=pixel_modeling,var.equal=T)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=pixel_modeling,var.equal=T)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("All Nests Flood-Failed in Pixel",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+
+}else{
+  
+results1$Difference <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(flooded_fate),data=pixel_modeling)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=pixel_modeling)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(pixel_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=pixel_modeling)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("All Nests Flood-Failed in Pixel",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+
+}
+
+if(equal.nest.fate==T){
+results1$Difference <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(fate),data=nest_modeling,var.equal=T)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=nest_modeling,var.equal=T)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=nest_modeling,var.equal=T)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("Nest Successful",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+
+}else{
+results1$Difference <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(fate),data=nest_modeling)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=nest_modeling)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(fate),data=nest_modeling)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("Nest Successful",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+}
+
+if(equal.nest.floodfate==T){
+results1$Difference <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(flooded_fate),data=nest_modeling,var.equal=T)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=nest_modeling,var.equal=T)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=nest_modeling,var.equal=T)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("Nest Flood-Failed",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1
+}else{
+results1$Difference <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) diff(t.test(x ~ as.factor(flooded_fate),data=nest_modeling)[["estimate"]])))
+      # collect the p value of the difference
+results1$p.Value <-unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=nest_modeling)[["p.value"]]))
+      # add variable names
+results1$Variable <-names(unlist(apply(nest_modeling%>%select(ends_with(comparison_list[j])),2,function(x) t.test(x ~ as.factor(flooded_fate),data=nest_modeling)[["p.value"]])))
+      # add nesting response
+results1$Response<-rep("Nest Flood-Failed",n_results)
+      # add add comparison type
+results1$Type<-rep(comparison_list[j],n_results)
+      #add results to list
+results_list1[[length(results_list1)+1]]<-results1  
+}
+}
+
+all_results1<-do.call('rbind',results_list1)
+all_results1[,c(4:5)]<-round(all_results1[,c(4:5)],4)
+
+write.csv(all_results1,paste0(outDir,"binary_response_band_relationship_statistics.csv"),row.names=F)
+```
+
+
+## Test for statistically significant relationships between mean and variance in SR time series and continuous nest responses
+```{r}
+# look at correlation among variables- all correlated, run separate
+all_terms<-c("Green_mean","Blue_mean","Red_mean","NIR_mean","SWIR1_mean","SWIR2_mean",
+             "Green_var","Blue_var","Red_var","NIR_var","SWIR1_var","SWIR2_var")
+cor(pixel_modeling[,all_terms])
+
+## Analysis Functions
+#---------------------------------------------------------------
+# Check for over dispersion
+ODFunc<-function(x){
+  chisq<-sum((resid(x, type='pearson')^2)) 
+  chisq/df.residual(x)
+  ##significantly greater than 1? 
+  out<-1-pchisq(chisq, df.residual(x))
+  print(out);print(ifelse(out<=0.05, "significant","Not significant"))
+}
+
+## Test different error distribution fits
+#---------------------------------------------------------------------------
+# 1 . start with a simple glmm without flood metrics
+####
+#nest model overdispersed. Negbinomial better fit.
+mod<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site), data=nest_modeling, family=binomial(link="logit"))
+
+#pixel model diagnostics look good. Not over dispersed.
+mod<-glmmTMB(flooded_prop_mean_2 ~ 1, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+mod<-glmmTMB(flooded_prop_max_1 ~ 1, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+mod<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ 1, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+mod<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ 1, data=pixel_modeling, family=binomial(link="logit"))
+
+  # look at diagnostic plots to see if they meet assumptions of non-dependence etc
+bmod_simres <- simulateResiduals(mod)
+plot(bmod_simres)
+  #looks like some dependence between residuals and fitted values in the data
+
+  # look at estimated mean and compare with histogram of data
+plogis(fixef(mod)[1])
+plogis(mod$fit$par[1])
+ggplot(pixel_modeling)+
+  geom_histogram(aes(x=flooded_prop_mean_2))+
+  xlab("Proportion Nest Contents Flooded")+
+  theme_bw(base_size = 12)
+  #looks approximately right if fully accounting for the inflated zeros...
+
+  #over dispersed?
+ODFunc(mod)
+  #Yes super over dispersed
+
+
+# 2. try a distribution that accounts for overdispersion - betabinomial, lognormal
+####
+od.mod<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site), data=nest_modeling, family=betabinomial(link="logit"))
+  
+#look at estimated mean and compare with histogram of data
+plogis(bb.mod$fit$par[1])
+
+  #diagnostic plots with simulated residuals
+bbmod_simres <- simulateResiduals(bb.mod)
+plot(bbmod_simres)
+  #look pretty good
+```
+
+```{r}
+#Fit models
+#nest models
+nest.rm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Red_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.rv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Red_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.gm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Green_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.gv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Green_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.bm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Blue_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.bv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+Blue_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.nm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+NIR_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.nv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+NIR_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.s1m<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+SWIR1_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.s1v<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+SWIR1_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.s2m<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+SWIR2_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.s2v<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+SWIR2_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.flatsm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+FLATS_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.flatsv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+FLATS_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.tcm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+TCWet_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.tcv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+TCWet_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.waterm<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+water_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.waterv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+water_var, data=nest_modeling, family=betabinomial(link="logit"))
+nest.ndwim<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+NDWI_mean, data=nest_modeling, family=betabinomial(link="logit"))
+nest.ndwiv<-glmmTMB(cbind(flooded_cont,maxeggs-flooded_cont) ~ (1|site)+NDWI_var, data=nest_modeling, family=betabinomial(link="logit"))
+
+#pixel models
+  # prop mean
+prop.mean.rm<-glmmTMB(flooded_prop_mean_2 ~ Red_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.rv<-glmmTMB(flooded_prop_mean_2 ~ Red_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.bm<-glmmTMB(flooded_prop_mean_2 ~ Blue_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.bv<-glmmTMB(flooded_prop_mean_2 ~ Blue_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.gm<-glmmTMB(flooded_prop_mean_2 ~ Green_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.gv<-glmmTMB(flooded_prop_mean_2 ~ Green_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.nm<-glmmTMB(flooded_prop_mean_2 ~ NIR_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.nv<-glmmTMB(flooded_prop_mean_2 ~ NIR_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.s1m<-glmmTMB(flooded_prop_mean_2 ~ SWIR1_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.s1v<-glmmTMB(flooded_prop_mean_2 ~ SWIR1_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.s2m<-glmmTMB(flooded_prop_mean_2 ~ SWIR2_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.s2v<-glmmTMB(flooded_prop_mean_2 ~ SWIR2_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.flatsm<-glmmTMB(flooded_prop_mean_2 ~ FLATS_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.flatsv<-glmmTMB(flooded_prop_mean_2 ~ FLATS_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.ndwim<-glmmTMB(flooded_prop_mean_2 ~ NDWI_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.ndwiv<-glmmTMB(flooded_prop_mean_2 ~ NDWI_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.tcm<-glmmTMB(flooded_prop_mean_2 ~ TCWet_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.tcv<-glmmTMB(flooded_prop_mean_2 ~ TCWet_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.waterm<-glmmTMB(flooded_prop_mean_2 ~ water_mean, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+prop.mean.waterv<-glmmTMB(flooded_prop_mean_2 ~ water_var, data=pixel_modeling[pixel_modeling$flooded_prop_mean_2<=1,], family=ordbeta(link="logit"))
+
+
+  #prop max
+prop.max.rm<-glmmTMB(flooded_prop_max_1 ~ Red_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.rv<-glmmTMB(flooded_prop_max_1 ~ Red_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.gm<-glmmTMB(flooded_prop_max_1 ~ Green_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.gv<-glmmTMB(flooded_prop_max_1 ~ Green_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.bm<-glmmTMB(flooded_prop_max_1 ~ Blue_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.bv<-glmmTMB(flooded_prop_max_1 ~ Blue_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.nm<-glmmTMB(flooded_prop_max_1 ~ NIR_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.nv<-glmmTMB(flooded_prop_max_1 ~ NIR_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.s1m<-glmmTMB(flooded_prop_max_1 ~ SWIR1_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.s1v<-glmmTMB(flooded_prop_max_1 ~ SWIR1_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.s2m<-glmmTMB(flooded_prop_max_1 ~ SWIR2_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.s2v<-glmmTMB(flooded_prop_max_1 ~ SWIR2_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.flatsm<-glmmTMB(flooded_prop_max_1 ~ FLATS_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.flatsv<-glmmTMB(flooded_prop_max_1 ~ FLATS_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.ndwim<-glmmTMB(flooded_prop_max_1 ~ NDWI_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.ndwiv<-glmmTMB(flooded_prop_max_1 ~ NDWI_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.tcm<-glmmTMB(flooded_prop_max_1 ~ TCWet_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.tcv<-glmmTMB(flooded_prop_max_1 ~ TCWet_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.waterm<-glmmTMB(flooded_prop_max_1 ~ water_mean, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+prop.max.waterv<-glmmTMB(flooded_prop_max_1 ~ water_var, data=pixel_modeling[pixel_modeling$flooded_prop_max_1<=1,], family=ordbeta(link="logit"))
+
+  #proportion successful
+prop.suc.rm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Red_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.rv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Red_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.gm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Green_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.gv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Green_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.bm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Blue_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.bv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ Blue_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.nm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ NIR_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.nv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ NIR_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.s1m<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ SWIR1_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.s1v<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ SWIR1_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.s2m<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ SWIR2_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.s2v<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ SWIR2_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.flatsm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ FLATS_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.flatsv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ FLATS_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.ndwim<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ NDWI_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.ndwiv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ NDWI_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.tcm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ TCWet_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.tcv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ TCWet_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.waterm<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ water_mean, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+prop.suc.waterv<-glmmTMB(cbind(n_nests_suc_5,n_nests_3-n_nests_suc_5) ~ water_var, data=pixel_modeling, ziformula = ~1,family=binomial(link="logit"))
+
+  #proportion flood-failed
+prop.flood.rm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Red_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.rv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Red_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.gm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Green_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.gv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Green_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.bm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Blue_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.bv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ Blue_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.nm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ NIR_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.nv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ NIR_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.s1m<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ SWIR1_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.s1v<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ SWIR1_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.s2m<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ SWIR2_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.s2v<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ SWIR2_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.flatsm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ FLATS_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.flatsv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ FLATS_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.ndwim<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ NDWI_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.ndwiv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ NDWI_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.tcm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ TCWet_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.tcv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ TCWet_var, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.waterm<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ water_mean, data=pixel_modeling, family=binomial(link="logit"))
+prop.flood.waterv<-glm(cbind(n_nests_flood_4,n_nests_3-n_nests_flood_4) ~ water_var, data=pixel_modeling, family=binomial(link="logit"))
+
+
+
+
+#list to contain all the models
+nest_list<-list(nest.bm,nest.bv,nest.gm,nest.gv,nest.rm,nest.rv,nest.nm,nest.nv,nest.s1m,nest.s1v,nest.s2m,nest.s2v,
+                nest.flatsm,nest.flatsv,nest.waterm,nest.waterv,nest.ndwim,nest.ndwiv,nest.tcm,nest.tcv)
+pix_list_prop_max<-list(prop.mean.bm,prop.mean.bv,prop.mean.gm,prop.mean.gv,prop.mean.rm,prop.mean.rv,prop.mean.nm,prop.mean.nv,prop.mean.s1m,prop.mean.s1v,prop.mean.s2m,prop.mean.s2v,
+                prop.mean.flatsm,prop.mean.flatsv,prop.mean.waterm,prop.mean.waterv,prop.mean.ndwim,prop.mean.ndwiv,prop.mean.tcm,prop.mean.tcv)
+pix_list_prop_mean<-list(prop.max.bm,prop.max.bv,prop.max.gm,prop.max.gv,prop.max.rm,prop.max.rv,prop.max.nm,prop.max.nv,prop.max.s1m,prop.max.s1v,prop.max.s2m,prop.max.s2v,
+                prop.max.flatsm,prop.max.flatsv,prop.max.waterm,prop.max.waterv,prop.max.ndwim,prop.max.ndwiv,prop.max.tcm,prop.max.tcv)
+pix_list_prop_suc<-list(prop.suc.bm,prop.suc.bv,prop.suc.gm,prop.suc.gv,prop.suc.rm,prop.suc.rv,prop.suc.nm,prop.suc.nv,prop.suc.s1m,prop.suc.s1v,prop.suc.s2m,prop.suc.s2v,
+                prop.suc.flatsm,prop.suc.flatsv,prop.suc.waterm,prop.suc.waterv,prop.suc.ndwim,prop.suc.ndwiv,prop.suc.tcm,prop.suc.tcv)
+pix_list_prop_flood<-list(prop.flood.bm,prop.flood.bv,prop.flood.gm,prop.flood.gv,prop.flood.rm,prop.flood.rv,prop.flood.nm,prop.flood.nv,prop.flood.s1m,prop.flood.s1v,prop.flood.s2m,prop.flood.s2v,
+                prop.flood.flatsm,prop.flood.flatsv,prop.flood.waterm,prop.flood.waterv,prop.flood.ndwim,prop.flood.ndwiv,prop.flood.tcm,prop.flood.tcv)
+
+#add all the model lists to a list
+mod_list<-list(nest_list,pix_list_prop_max,pix_list_prop_mean,pix_list_prop_suc,pix_list_prop_flood)
+#name the response in the same order
+response_list<-c("Proportion.Nest.Contents.Flooded","Max.Proportion.Nest.Contents.Flooded","Mean.Proportion.Nest.Contents.Flooded","Proportion Nests Successful","Proportion Nests Flood-Failed")
+
+## Model Inference
+#---------------------------------------------------------------------
+results_list<-list()
+
+#for each response variable model list...
+for(j in 1:length(mod_list)){
+
+mods<-mod_list[[j]]
+
+results<-data.frame(Response=NA,Variable=NA, Odds.Ratio=NA, Conf.High=NA, Conf.Low=NA, Change.In.Response=NA,p.Value=NA,LRT=NA)
+
+for(i in 1:length(mods)){
+#format the coefficients and confidence intervals
+coef.temp <- broom.mixed::tidy(mods[[i]], conf.int = TRUE)
+
+results[i,]$Response<-response_list[j]
+results[i,]$Variable<-coef.temp[2,]$term
+#Odds ratio is the percent change in the original odds of the response. 1.05=5% increase in the odds (success/fails).
+results[i,]$Odds.Ratio<-exp(coef.temp[2,]$estimate)
+results[i,]$Conf.High<-exp(coef.temp[2,]$conf.high)
+results[i,]$Conf.Low<-exp(coef.temp[2,]$conf.low)
+#subtract the response (y) when x=0 from the response when x=1. Positive means increase, negative means decreasing impact.
+results[i,]$Change.In.Response<-plogis(coef.temp[1,]$estimate+coef.temp[2,]$estimate)-plogis(coef.temp[1,]$estimate)
+results[i,]$p.Value<-coef.temp[2,]$p.value
+# ANOVA- is the residual deviance significantly improved by adding the spectral variable?
+results[i,]$LRT<-car::Anova(mods[[i]],type="II")[,3] #returns the p value of chi squared statistic
+}
+
+results$Variable<-factor(results$Variable, levels=c('Blue_mean', 'Green_mean', 'Red_mean', 'NIR_mean', 'SWIR1_mean',
+                                      'SWIR2_mean','FLATS_mean','NDWI_mean','TCWet_mean','water_mean',
+                                      'Blue_var', 'Green_var', 'Red_var', 'NIR_var', 'SWIR1_var',
+                                      'SWIR2_var','FLATS_var','NDWI_var','TCWet_var','water_var'))
+results_list[[j]]<-results
+}
+
+all_results<-do.call('rbind',results_list)
+  #make inf and super big values cap at 1000
+all_results<-all_results%>%
+  mutate(Odds.Ratio=ifelse(Odds.Ratio>10000|Odds.Ratio=="Inf",10000,Odds.Ratio),
+         Conf.High=ifelse(Conf.High>10000|Conf.High=="Inf",10000,Conf.High))
+  # round everything
+all_results[,-c(1:2)]<-round(all_results[,-c(1:2)],4)
+#lower SWIR2 variance in pixels with a higher proportion of successful nests (pval=0.09, odds ratio ~0, Chisq from ANOVA 0.055), higher variance and mean in CFMask water classification in pixels with a higher mean proportion of nest contents flooded (pval=0.003, odds ratios greater than 1000(lower ci 457 for mean, 619 for variance), Chisq from ANOVA 0.003)
+write.csv(all_results,paste0(outDir,"continuous_response_band_relationship_statistics.csv"),row.names=F)
+
+```
+
