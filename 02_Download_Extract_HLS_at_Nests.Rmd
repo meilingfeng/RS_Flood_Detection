@@ -1,0 +1,575 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+
+# load packages
+```{r}
+packages <- c('terra','jsonlite','sp',
+              'rasterVis','tidyverse','magrittr','RColorBrewer','xml2','dygraphs',
+              'xts','DT', 'rprojroot','sf','imager','tidyterra')
+invisible(lapply(packages, library, character.only = TRUE))
+
+```
+
+# set directories
+```{r}
+outDir<-"D:/Flood_Index/Outputs/"
+inDir<-"D:/Flood_Index/Data/"
+```
+
+#set the path to your netrc file. This has your login credentials for NASA earthdata.
+```{r}
+source("Functions/earthdata_netrc_setup.R")
+```
+
+# Set spatial regions of interest
+```{r}
+marsh<-terra::vect(paste0(inDir,"boundaries/SALS_breeding_19Apr23.shp"))
+
+marsh_sf<-st_as_sf(marsh)%>%
+  sf::st_transform('+proj=longlat +datum=WGS84')
+
+
+#slice into states to minimize the boundary extents
+marsh_sf_list<-split(marsh_sf,marsh_sf$STATE)
+
+#st_write(st_as_sf(st_as_sfc(st_bbox(marsh_sf_list[["CT"]]), crs=crs(marsh_sf_list[["CT"]]))),paste0(outDir,"CT_marsh_poly.geojson"))
+
+```
+
+# Load Queried RS image data
+```{r}
+load(file=paste0(outDir,"All_States_2016_24_Nests_band_data.Rdata")) #CT, NJ, NH, ME, DE, VA, MD, NY 2016-2024, May 15-Aug01
+```
+
+#Load nest data
+```{r}
+# spatial information
+nest_shp<-st_read(paste0(inDir,"Nests/nest_locations_01_29_25.shp"))%>%
+  rename(nest_id=id)%>%
+  select(nest_id)
+
+# nest id information
+nest_locations<-read.csv(paste0(inDir,"Nests/corrected_nest_coords_01_29_25.csv"))%>%
+  rename(nest_id=id,site=site.code,year=Year)%>%
+  # Add nest identifying columns
+  #add nest number
+  mutate(nest_num=as.numeric(substr(nest_id,(nchar(nest_id)-2),nchar(nest_id))))%>%
+  select(-fate)%>%
+  distinct(nest_id,.keep_all = T)
+
+# nest fate/response information
+fates<-read.csv(paste0(inDir,"Nests/NestFates_2001-2024.csv"),na.strings=c("","NOT REC","NA"))%>%
+  #select and format variables
+  dplyr::select("nest_id"="SHARPNestID","UltimateNestFate",
+                "maxeggs"="MaxNumEggs","Nsuccess"="NumFledged",
+                "NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                "NumChicksFlooded","NumChicksFloodedMissing")%>%
+  mutate(across(c("NumEggsFloodedInNest","NumEggsFloodedFromNest","NumEggsFloodedMissing",
+                  "NumChicksFlooded","NumChicksFloodedMissing","maxeggs","Nsuccess"),
+                as.numeric))%>%
+  # Format fate response variables
+  rowwise()%>%
+         # 1. proportion nestlings lost to flooding
+  mutate(flooded_prop=sum(c(NumEggsFloodedInNest,NumEggsFloodedFromNest,NumEggsFloodedMissing,
+                            NumChicksFlooded,NumChicksFloodedMissing),na.rm = T),
+         flooded_prop=round(flooded_prop/maxeggs,2),
+         # 2. Probability nest failed/was successful in general
+         fate=case_when(
+           UltimateNestFate%in%c("FLEDGED")~1,
+           UltimateNestFate%in%c("DEPREDATED","FAIL UNKNOWN","FLOODED")~0,
+           is.na(UltimateNestFate)|!(UltimateNestFate%in%c("DEPREDATED","FLEDGED","FAIL UNKNOWN","FLOODED"))~NA),
+         # 3. Probability nest failed due to flooding
+         flooded_fate=ifelse(UltimateNestFate%in%c("FLOODED"),1,0))%>%
+  ungroup()%>%
+  select(nest_id, flooded_prop,fate,flooded_fate)%>%
+  distinct(nest_id,.keep_all = T)
+  # set all fate variables to NA for nests with NA for ultimate nest fate
+fates[is.na(fates$fate),c(2,4)]<-NA
+fates[is.nan(fates$flooded_prop),2]<-NA
+
+
+# nest initiation dates
+init_dates<-read.csv(paste0(inDir,"Nests/time_since_tide_SALS.csv"))%>%
+  select(nest_id=id,init_date)
+
+
+nests<-left_join(nest_locations,fates,by=c("nest_id"))%>%
+  distinct(nest_id,.keep_all = T)%>%
+  left_join(init_dates,by=c("nest_id"))
+nests<-left_join(nests,nest_shp,by = c("nest_id"))
+
+#fill in records missing states
+
+```
+
+# Access and Interact with the HLS data you queried
+
+```{r, results= "hide"}
+#Set up rgdal configurations to access the cloud assets that we are interested in.
+#You can learn more about these configuration options [here](https://trac.osgeo.org/gdal/wiki/ConfigOptions). 
+setGDALconfig("GDAL_HTTP_UNSAFESSL", value = "YES")
+setGDALconfig("GDAL_HTTP_COOKIEFILE", value = ".rcookies")
+setGDALconfig("GDAL_HTTP_COOKIEJAR", value = ".rcookies")
+setGDALconfig("GDAL_DISABLE_READDIR_ON_OPEN", value = "EMPTY_DIR")
+setGDALconfig("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", value = "TIF")
+```
+
+
+
+## Subset HLS COGs Spatially and Stack HLS Data Layers
+Below, convert the state regions of interest projections into the native projection 
+of HLS, UTM (aligned to the Military Grid Reference System). This must be done 
+in order to use the Regions of Interest (ROIs) to subset the image files.
+If you have trouble running the code chunk below, make sure your credentials are 
+entered correctly in the created netrc file.
+
+```{r, warning=FALSE}
+# Extract the CRS from one of the assets for each state region
+coord_ref<-vector(mode='list', length=length(state_list))
+names(coord_ref)<-names(state_list)
+for(state in names(state_list)){
+coord_ref[[state]]<- terra::rast(paste0(state_list[[state]]$Asset_Link[1]))
+}
+
+# set each state to its UTM coordinate system (that's what the HLS data is in)
+terra::crs(coord_ref[["CT"]])#make sure this is UTM 18
+for(state in names(state_list)){
+marsh_sf_list[[state]]<- st_transform(marsh_sf_list[[state]],terra::crs(coord_ref[[state]]))
+}
+```
+
+Below, we create a list of raster layers for each of our bands of interest 
+(e.g., Red, NIR, Fmask...). Next each band is read into the memory and then 
+cropped to our area of interest. The Cropped raster will be stacked and  We'll use 
+these stacks to calculate water classifications and mask 
+for cloud contamination. 
+
+Note that the `raster` function is making a separate 
+request for each data layer located in the Cumulus cloud archive. This takes time,
+and the more data layers we have in the time series, the longer this cell takes to
+run.  
+
+
+```{r, warning=FALSE, results= "hide"}
+#writeRaster(fmask_stack[[1]],paste0(outDir,"CTmarsh_UTM18_30mraster_template.tif"))
+# template raster to align CT images in UTM 19 to a standard CRS and extent
+ct18_temp<-terra::rast(paste0(outDir,"CTmarsh_UTM18_30mraster_template.tif"))
+
+
+# Do this by state region
+    # specify state -names(state_list)
+state="CT"
+
+    # places to hold the cropped bands across all images
+blue_stack<-green_stack<-red_stack<-nir_stack<-swir1_stack<-swir2_stack<-therm1_stack<-therm2_stack<-fmask_stack<- date_list<-list()
+
+    # markers for each band list (should correspond with image index number)
+l <- m <- n <-o <- p<- q<- r<- s<- u<- 0
+
+    # pull the image query results that correspond with the state
+  search_df_state<- state_list[[state]]
+
+    # if the state is connecticut, don't use a standard ROI, we need to specify whether its UTM18 or 19, image by image.
+  if(state!="CT"){
+  roi<-marsh_sf_list[[state]]
+  }
+  
+    #subset nest data to state region
+  nests_state<-nests%>%
+  filter(State==state,year>=2016,Species=="SALS")
+  
+
+    # load each band for all state images, crop, and sort into the appropriate band list
+for (row in 1:length(search_df_state$band)){#seq(length(search_df_state$band))
+    #is it a swir 2 image?
+  if (search_df_state$band[row] %in% c('B07','B12')){
+    n = n+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    swir2_stack[[n]] <- band_r_crop
+        # reset objects
+    rm (band_r, band_r_crop)
+    
+    #is it a swir 1 image?
+  }else if (search_df_state$band[row]=='B06' || (search_df_state$band[row]=='B11'&& substr(search_df_state$Collection[row],4,4)=="S")){
+    o = o+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    swir1_stack[[o]] <- band_r_crop
+    rm (band_r, band_r_crop)
+    
+    #is it a NIR image?
+  }else if (search_df_state$band[row] %in% c('B05','B8A')){
+    p = p+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    nir_stack[[p]] <- band_r_crop
+    rm (band_r, band_r_crop)
+    
+    # is it a red image?
+  }else if (search_df_state$band[row]=='B04'){
+    q = q+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    red_stack[[q]] <- band_r_crop
+    rm (band_r, band_r_crop)
+    
+    #is it a blue image?
+  }else if (search_df_state$band[row]=='B02'){
+    r = r+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    blue_stack[[r]] <- band_r_crop
+    rm (band_r, band_r_crop)
+    
+    
+    #is it a green image?
+  }else if (search_df_state$band[row]=='B03'){
+    s = s+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    green_stack[[s]] <- band_r_crop
+    rm (band_r, band_r_crop)
+    
+ 
+    #is it a Quality image?
+  }else if (search_df_state$band[row]=='Fmask'){
+        # Set new band list index
+    u = u+1
+        #read in band image
+    band_r <- terra::rast(paste0('/vsicurl/', search_df_state$Asset_Link[row]))
+        #get image date and time
+    doy_time = strsplit(sources(band_r), "[.]")[[1]][14]
+    doy = substr(doy_time, 1, 7)
+    date <- as.Date(as.integer(substr(doy,5,7)), origin = paste0(substr(doy,1,4), "-01-01"))
+    time <- paste(substr(doy_time, 9, 10),substr(doy_time, 11, 12),sep=":")
+        #crop to ROI
+            # If the state region is not CT, use that state's extent
+    if(state!="CT"){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(roi)), roi)
+            # If the state is CT and the band is in UTM19, align it to UTM 18 using resample().
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 18|Zone 18")){
+      band_r_crop <- terra::mask(terra::crop(band_r, terra::ext(marsh_sf_list[["CT"]]),extend=T), marsh_sf_list[["CT"]])
+    }else if(state=="CT"&str_detect(crs(band_r),"zone 19|Zone 19")){
+      band_r_crop<-terra::mask(terra::resample(terra::project(band_r,terra::crs(ct18_temp)),ct18_temp), marsh_sf_list[["CT"]])
+    }
+        # set name as the image date
+    names(band_r_crop)<-as.character(date)
+        # add to band stack
+    fmask_stack[[u]] <- band_r_crop
+    
+    # also record the image information and add to a matching index list
+    if (strsplit(sources(band_r), "[.]")[[1]][12] == 'S30'){
+      date_list[[u]] <- paste0('S',as.character(date),'T',time)
+    }else{
+      date_list[[u]] <- paste0('L',as.character(date),'T',time)
+    }
+    rm (band_r, band_r_crop)
+    
+  }
+  
+
+# Save memory by processing ~50 images (all bands for each image) at a time
+  #Also make sure it stops at a complete image (all images end at fmask)
+  if(search_df_state$band[row]=='Fmask' & u==50){
+    
+#name the bands by date
+names(blue_stack) <- unlist(date_list)
+names(green_stack) <- unlist(date_list)
+names(red_stack) <- unlist(date_list)
+names(nir_stack) <- unlist(date_list)
+names(swir1_stack) <- unlist(date_list)
+names(swir2_stack) <- unlist(date_list)
+names(fmask_stack) <- unlist(date_list)
+
+# create a list to hold the pixel values for each nest
+blue_pix<-green_pix<-red_pix<-nir_pix<-swir1_pix<-swir2_pix<-fmask_pix<-list()
+
+#for each nest, extract pixel values
+for(i in 1:nrow(nests_state)){
+  # extract blue
+blue_pix[[i]]<-lapply(blue_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+blue_pix[[i]]<-do.call('rbind',lapply(blue_pix[[i]],function(x){
+  names(x)<-c("ID","blue")
+  return(x)
+}))
+blue_pix[[i]]<-blue_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = blue)
+
+# extract green
+green_pix[[i]]<-lapply(green_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+green_pix[[i]]<-do.call('rbind',lapply(green_pix[[i]],function(x){
+  names(x)<-c("ID","green")
+  return(x)
+}))
+green_pix[[i]]<-green_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = green)
+
+
+# extract red
+red_pix[[i]]<-lapply(red_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+red_pix[[i]]<-do.call('rbind',lapply(red_pix[[i]],function(x){
+  names(x)<-c("ID","red")
+  return(x)
+}))
+red_pix[[i]]<-red_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = red)
+
+
+# extract nir
+nir_pix[[i]]<-lapply(nir_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+nir_pix[[i]]<-do.call('rbind',lapply(nir_pix[[i]],function(x){
+  names(x)<-c("ID","nir")
+  return(x)
+}))
+nir_pix[[i]]<-nir_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = nir)
+
+
+# extract swir1
+swir1_pix[[i]]<-lapply(swir1_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+swir1_pix[[i]]<-do.call('rbind',lapply(swir1_pix[[i]],function(x){
+  names(x)<-c("ID","swir1")
+  return(x)
+}))
+swir1_pix[[i]]<-swir1_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = swir1)
+
+
+# extract swir2
+swir2_pix[[i]]<-lapply(swir2_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+swir2_pix[[i]]<-do.call('rbind',lapply(swir2_pix[[i]],function(x){
+  names(x)<-c("ID","swir2")
+  return(x)
+}))
+swir2_pix[[i]]<-swir2_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = swir2)
+
+
+#extract Fmask
+fmask_pix[[i]]<-lapply(fmask_stack,function(x) terra::extract(x,terra::project(vect(nests_state[i,]), crs(x))))
+fmask_pix[[i]]<-do.call('rbind',lapply(fmask_pix[[i]],function(x){
+  names(x)<-c("ID","fmask")
+  return(x)
+}))
+fmask_pix[[i]]<-fmask_pix[[i]]%>%
+    rownames_to_column(var="date_time")%>%
+    pivot_wider(names_from=date_time,values_from = fmask)
+
+}
+
+
+  #combine all the band extraction columns for each nest into one table with rbind
+blue_pix2<-do.call('rbind',blue_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "Blue")%>%
+  drop_na(Blue)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+green_pix2<-do.call('rbind',green_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "Green")%>%
+  drop_na(Green)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+red_pix2<-do.call('rbind',red_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "Red")%>%
+  drop_na(Red)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+nir_pix2<-do.call('rbind',nir_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "NIR")%>%
+  drop_na(NIR)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+swir1_pix2<-do.call('rbind',swir1_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "SWIR1")%>%
+  drop_na(SWIR1)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+swir2_pix2<-do.call('rbind',swir2_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "SWIR2")%>%
+  drop_na(SWIR2)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+fmask_pix2<-do.call('rbind',fmask_pix)%>%
+  arrange(ID)%>%
+  cbind(st_drop_geometry(nests_state[,1:3]))%>%
+  dplyr::select(-ID)%>%
+  pivot_longer(cols=-c(nest_id,site,year), names_to = c("Date","Time"),names_prefix = "^.{1}",names_sep = "T",
+               values_to = "FMask")%>%
+  drop_na(FMask)%>%
+  mutate(Date=ymd(Date))%>%
+  arrange(nest_id,Date)
+
+
+  # combine all the bands into one dataframe
+nests_all_bands<-do.call('cbind', list(blue_pix2,green_pix2[,ncol(green_pix2)],red_pix2[,ncol(red_pix2)],nir_pix2[,ncol(nir_pix2)],                 swir1_pix2[,ncol(swir1_pix2)],swir2_pix2[,ncol(swir2_pix2)],fmask_pix2[,ncol(fmask_pix2)]))
+
+  # write data to file
+write.csv(nests_all_bands,paste0(outDir,"CT_nests_all_HLS_bands_row",row,".csv"),row.names=F)
+    
+  # reset places to hold the cropped bands across all images
+blue_stack<-green_stack<-red_stack<-nir_stack<-swir1_stack<-swir2_stack<-therm1_stack<-therm2_stack<-fmask_stack<- date_list<-list()
+
+    # reset markers for each band list (should correspond with image number)
+l <- m <- n <-o <- p<- q<- r<- s<- u<- 0
+
+    # remove objects
+rm(blue_pix,green_pix,red_pix,nir_pix,swir1_pix,swir2_pix,fmask_pix,
+   blue_pix2,green_pix2,red_pix2,nir_pix2,swir1_pix2,swir2_pix2,fmask_pix2,
+   nests_all_bands)
+
+    #clear unused memory
+gc()
+    
+  }
+  
+# Finally, if the process is complete, write a template raster to file to count how many pixels contain nests later on
+  if(row==length(search_df_state$band)){
+writeRaster(fmask_stack[[1]],paste0(outDir,state,"marsh_HLS30raster_template.tif"))
+  }
+  
+}
+
+
+
+```
