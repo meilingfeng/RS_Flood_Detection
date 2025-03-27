@@ -545,7 +545,7 @@ fmask_pix2<-do.call('rbind',fmask_pix)%>%
 nests_all_bands<-do.call('cbind', list(blue_pix2,green_pix2[,ncol(green_pix2)],red_pix2[,ncol(red_pix2)],nir_pix2[,ncol(nir_pix2)],                 swir1_pix2[,ncol(swir1_pix2)],swir2_pix2[,ncol(swir2_pix2)],fmask_pix2[,ncol(fmask_pix2)]))
 
   # write data to file
-write.csv(nests_all_bands,paste0(outDir,"CT_nests_all_HLS_bands_row",row,".csv"),row.names=F)
+write.csv(nests_all_bands,paste0(outDir,state,"_nests_all_HLS_bands_row",row,".csv"),row.names=F)
     
   # reset places to hold the cropped bands across all images
 blue_stack<-green_stack<-red_stack<-nir_stack<-swir1_stack<-swir2_stack<-therm1_stack<-therm2_stack<-fmask_stack<- date_list<-list()
