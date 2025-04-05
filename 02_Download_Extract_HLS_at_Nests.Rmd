@@ -178,7 +178,8 @@ l <- m <- n <-o <- p<- q<- r<- s<- u<- 0
   
     #subset nest data to state region
   nests_state<-nests%>%
-  filter(State==state,year>=2016,Species=="SALS")
+      # extract all available years (2016-2024) from all nest locations
+  filter(State==state)#,year>=2016,Species=="SALS")
   
 
     # load each band for all state images, crop, and sort into the appropriate band list
