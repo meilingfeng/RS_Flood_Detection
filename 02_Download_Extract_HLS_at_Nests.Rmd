@@ -98,7 +98,7 @@ init_dates<-read.csv(paste0(inDir,"Nests/time_since_tide_SALS.csv"))%>%
 nests<-left_join(nest_locations,fates,by=c("nest_id"))%>%
   distinct(nest_id,.keep_all = T)%>%
   left_join(init_dates,by=c("nest_id"))
-nests<-left_join(nests,nest_shp,by = c("nest_id"))
+nests<-left_join(nest_shp,nests,by = c("nest_id"))
 
 #fill in records missing states
 
@@ -142,7 +142,7 @@ marsh_sf_list[[state]]<- st_transform(marsh_sf_list[[state]],terra::crs(coord_re
 
 Below, we create a list of raster layers for each of our bands of interest 
 (e.g., Red, NIR, Fmask...). Next each band is read into the memory and then 
-cropped to our area of interest. The Cropped raster will be stacked and  We'll use 
+cropped to our area of interest. The Cropped raster will be stacked and we'll use 
 these stacks to calculate water classifications and mask 
 for cloud contamination. 
 
@@ -160,7 +160,11 @@ ct18_temp<-terra::rast(paste0(outDir,"CTmarsh_UTM18_30mraster_template.tif"))
 
 # Do this by state region
     # specify state -names(state_list)
-state="CT"
+states<- c("ME","NH","CT","NY","NJ","DE","MD","VA")
+
+for (s in 1:length(states)){
+
+state=states[s]
 
     # places to hold the cropped bands across all images
 blue_stack<-green_stack<-red_stack<-nir_stack<-swir1_stack<-swir2_stack<-therm1_stack<-therm2_stack<-fmask_stack<- date_list<-list()
@@ -570,7 +574,7 @@ writeRaster(fmask_stack[[1]],paste0(outDir,state,"marsh_HLS30raster_template.tif
   }
   
 }
-
+}
 
 
 ```
